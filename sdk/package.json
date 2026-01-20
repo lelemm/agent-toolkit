@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "scripts": {
+    "test": "node ./node_modules/vitest/vitest.mjs run",
+    "test:watch": "node ./node_modules/vitest/vitest.mjs"
+  },
+  "dependencies": {
+    "luxon": "^3.7.2"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^24.10.9",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  }
+}
