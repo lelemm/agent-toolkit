@@ -1,6 +1,49 @@
 {
+  "name": "agent-toolkit-sdk",
+  "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "description": "Small TypeScript SDK clients and policy helpers for agent workflows.",
+  "license": "MIT",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./clickup": {
+      "types": "./dist/clickup.d.ts",
+      "default": "./dist/clickup.js"
+    },
+    "./vikunja": {
+      "types": "./dist/vikunja.d.ts",
+      "default": "./dist/vikunja.js"
+    },
+    "./calendar": {
+      "types": "./dist/calendar.d.ts",
+      "default": "./dist/calendar.js"
+    },
+    "./time_tracking": {
+      "types": "./dist/time_tracking.d.ts",
+      "default": "./dist/time_tracking.js"
+    },
+    "./secrets": {
+      "types": "./dist/secrets.d.ts",
+      "default": "./dist/secrets.js"
+    },
+    "./policy": {
+      "types": "./dist/policy.d.ts",
+      "default": "./dist/policy.js"
+    }
+  },
   "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "demo": "npm run build && node dist/demo.js",
     "test": "node ./node_modules/vitest/vitest.mjs run",
     "test:watch": "node ./node_modules/vitest/vitest.mjs"
   },
