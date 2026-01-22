@@ -6,6 +6,17 @@ export type TimeTrackingClientConfig = {
 
 export type TriggerType = "Business Request" | "Incident" | "System Change" | "Planned Work";
 
+export type TimeTrackingClickUpTask = {
+  taskId: string;
+  name: string;
+  url?: string;
+  status?: string;
+  isSelectable?: boolean | null;
+  customFields?: Record<string, unknown> | null;
+  fetchedAt?: string;
+  lastUsedAt?: string | null;
+};
+
 export type TimeEntry = {
   id: string;
   userId: string;
@@ -108,17 +119,21 @@ export type StartTrackingRequest = {
 };
 
 export type StopTrackingResponse = {
-  timeEntryId: string;
-  enrichmentLogId: string;
+  ok: boolean;
+  entry: TrackedTimeEntry;
+  timeEntry: TimeEntry;
+  enrichmentQueued: boolean;
+  enrichmentLogId: string | null;
 };
 
 export type ApiKey = {
   id: string;
-  name: string;
-  prefix: string;
-  createdAt: string;
+  name: string | null;
+  keyPrefix: string;
   lastUsedAt?: string | null;
   revokedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type AppSettings = Record<string, unknown>;
@@ -171,11 +186,19 @@ export class TimeTrackingClient {
 
   private async request<T>(
     path: string,
-    options?: { method?: string; body?: unknown; query?: Record<string, unknown> }
+    options?: {
+      method?: string;
+      body?: unknown;
+      query?: Record<string, unknown>;
+      authMode?: "apiKey";
+    }
   ): Promise<T> {
     const url = `${this.baseUrl}${path}${buildQuery(options?.query)}`;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+    const authMode = options?.authMode ?? "apiKey";
+    if (this.apiKey && (authMode === "apiKey" || authMode === "both")) {
+      headers["x-api-key"] = this.apiKey;
+    }
     const response = await this.fetchImpl(url, {
       method: options?.method ?? "GET",
       headers,
@@ -201,28 +224,34 @@ export class TimeTrackingClient {
     return this.request("/api/time-entries", { method: "POST", body: payload });
   }
 
-  updateTimeEntry(id: string, payload: UpdateTimeEntry): Promise<{ entry: TimeEntry }> {
+  updateTimeEntry(id: string, payload: UpdateTimeEntry): Promise<{ ok: boolean; result: unknown }> {
     return this.request(`/api/time-entries/${id}`, { method: "PUT", body: payload });
   }
 
-  deleteTimeEntry(id: string): Promise<{ ok: boolean }> {
+  deleteTimeEntry(id: string): Promise<void> {
     return this.request(`/api/time-entries/${id}`, { method: "DELETE" });
   }
 
-  enrichTimeEntry(id: string): Promise<{ ok: boolean; enrichmentLogId: string }> {
+  enrichTimeEntry(id: string): Promise<{ ok: boolean; fields: EnrichedFields }> {
     return this.request(`/api/time-entries/${id}/enrich`, { method: "POST" });
   }
 
-  startTracking(payload: StartTrackingRequest): Promise<{ trackedEntry: TrackedTimeEntry }> {
+  startTracking(payload: StartTrackingRequest): Promise<{ entry: TrackedTimeEntry }> {
     return this.request("/api/tracker/start", { method: "POST", body: payload });
   }
 
-  stopTracking(): Promise<StopTrackingResponse> {
-    return this.request("/api/tracker/stop", { method: "POST" });
+  stopTracking(body?: { enrich?: boolean }): Promise<StopTrackingResponse> {
+    return this.request("/api/tracker/stop", { method: "POST", body });
   }
 
-  getTrackingStatus(): Promise<{ status: "tracking" | "not_tracking"; trackedEntry?: TrackedTimeEntry }> {
-    return this.request("/api/tracker/status");
+  getCurrentTrackingSession(): Promise<{ entry: TrackedTimeEntry | null }> {
+    return this.request("/api/tracker/current");
+  }
+
+  async getTrackingStatus(): Promise<{ status: "tracking" | "not_tracking"; trackedEntry?: TrackedTimeEntry }> {
+    const { entry } = await this.getCurrentTrackingSession();
+    if (entry) return { status: "tracking", trackedEntry: entry };
+    return { status: "not_tracking" };
   }
 
   listTrackedEntries(): Promise<{ entries: TrackedTimeEntry[] }> {
@@ -241,7 +270,7 @@ export class TimeTrackingClient {
     return this.request(`/api/enrichment-logs/${id}/retry`, { method: "POST" });
   }
 
-  searchClickUpTasks(query: string): Promise<{ tasks: Array<{ id: string; name: string }> }> {
+  searchClickUpTasks(query: string): Promise<{ tasks: TimeTrackingClickUpTask[] }> {
     return this.request("/api/clickup/tasks", { query: { q: query } });
   }
 
@@ -269,15 +298,4 @@ export class TimeTrackingClient {
     return this.request("/api/settings/clickup", { method: "PUT", body: settings });
   }
 
-  listApiKeys(): Promise<{ keys: ApiKey[] }> {
-    return this.request("/api/api-keys");
-  }
-
-  createApiKey(payload: { name: string }): Promise<{ key: ApiKey; token: string }> {
-    return this.request("/api/api-keys", { method: "POST", body: payload });
-  }
-
-  revokeApiKey(id: string): Promise<{ ok: boolean; result?: unknown }> {
-    return this.request(`/api/api-keys/${id}/revoke`, { method: "POST" });
-  }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { TimeTrackingClient } from "../time_tracking";
-import { createMockFetch, jsonResponse } from "./test_utils";
+import { TimeTrackingClient } from "../time_tracking.js";
+import { createMockFetch, jsonResponse } from "./test_utils.js";
 
 describe("TimeTrackingClient", () => {
   it("sets x-api-key header when provided", async () => {
@@ -16,6 +16,7 @@ describe("TimeTrackingClient", () => {
 
     const headers = (calls[0]!.init?.headers ?? {}) as Record<string, string>;
     expect(headers["x-api-key"]).toBe("k123");
+    expect(headers.Authorization).toBeUndefined();
     expect(headers["Content-Type"]).toBe("application/json");
   });
 

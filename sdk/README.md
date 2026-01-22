@@ -19,6 +19,10 @@ npm test
 npm run build
 ```
 
+## Deno usage (direct TypeScript import)
+
+If you import these `.ts` files directly from Deno, `sdk/deno.json` provides an import map so bare imports like `luxon` resolve correctly via npm.
+
 ## Runnable demo (no credentials)
 
 ```bash

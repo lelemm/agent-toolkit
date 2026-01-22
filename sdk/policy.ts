@@ -7,7 +7,7 @@
 // - Avoid secrets or environment access here.
 // - Prefer pure functions (no network IO).
 
-import { DateTime } from "npm:luxon";
+import { DateTime } from "luxon";
 
 export const POLICY_VERSION = "1.0.0";
 
