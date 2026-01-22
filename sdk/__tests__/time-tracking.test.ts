@@ -3,13 +3,12 @@ import { TimeTrackingClient } from "../time_tracking";
 import { createMockFetch, jsonResponse } from "./test_utils";
 
 describe("TimeTrackingClient", () => {
-  it("sets x-api-key and bearer auth headers when provided", async () => {
+  it("sets x-api-key header when provided", async () => {
     const { fetchImpl, calls } = createMockFetch(() => jsonResponse({ entries: [] }, { status: 200 }));
 
     const client = new TimeTrackingClient({
       baseUrl: "https://tt.test",
       apiKey: "k123",
-      bearerToken: "b123",
       fetchImpl,
     });
 
@@ -17,7 +16,6 @@ describe("TimeTrackingClient", () => {
 
     const headers = (calls[0]!.init?.headers ?? {}) as Record<string, string>;
     expect(headers["x-api-key"]).toBe("k123");
-    expect(headers.Authorization).toBe("Bearer b123");
     expect(headers["Content-Type"]).toBe("application/json");
   });
 

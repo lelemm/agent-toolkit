@@ -24,7 +24,6 @@ export const ENV_KEYS = {
   GRAPH_BASE_URL: "GRAPH_BASE_URL",
   TIME_TRACKING_BASE_URL: "TIME_TRACKING_BASE_URL",
   TIME_TRACKING_API_KEY: "TIME_TRACKING_API_KEY",
-  TIME_TRACKING_BEARER_TOKEN: "TIME_TRACKING_BEARER_TOKEN",
   VIKUNJA_BASE_URL: "VIKUNJA_BASE_URL",
   VIKUNJA_TOKEN: "VIKUNJA_TOKEN",
   VIKUNJA_USERNAME: "VIKUNJA_USERNAME",
@@ -44,7 +43,6 @@ export type GraphSecrets = {
 export type TimeTrackingSecrets = {
   baseUrl?: string;
   apiKey?: string;
-  bearerToken?: string;
 };
 
 export type VikunjaSecrets = {
@@ -72,7 +70,6 @@ export const getTimeTrackingSecrets = (
 ): TimeTrackingSecrets => ({
   baseUrl: optionalEnv(ENV_KEYS.TIME_TRACKING_BASE_URL, readEnv),
   apiKey: optionalEnv(ENV_KEYS.TIME_TRACKING_API_KEY, readEnv),
-  bearerToken: optionalEnv(ENV_KEYS.TIME_TRACKING_BEARER_TOKEN, readEnv),
 });
 
 export const getVikunjaSecrets = (readEnv: EnvReader = defaultEnvReader): VikunjaSecrets => ({

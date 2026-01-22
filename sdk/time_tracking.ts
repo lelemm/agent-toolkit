@@ -1,7 +1,6 @@
 export type TimeTrackingClientConfig = {
   baseUrl?: string;
   apiKey?: string;
-  bearerToken?: string;
   fetchImpl?: typeof fetch;
 };
 
@@ -162,13 +161,11 @@ const toErrorMessage = async (response: Response): Promise<string> => {
 export class TimeTrackingClient {
   private baseUrl: string;
   private apiKey?: string;
-  private bearerToken?: string;
   private fetchImpl: typeof fetch;
 
   constructor(config: TimeTrackingClientConfig) {
     this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
     this.apiKey = config.apiKey;
-    this.bearerToken = config.bearerToken;
     this.fetchImpl = config.fetchImpl ?? fetch;
   }
 
@@ -179,7 +176,6 @@ export class TimeTrackingClient {
     const url = `${this.baseUrl}${path}${buildQuery(options?.query)}`;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
-    if (this.bearerToken) headers.Authorization = `Bearer ${this.bearerToken}`;
     const response = await this.fetchImpl(url, {
       method: options?.method ?? "GET",
       headers,
