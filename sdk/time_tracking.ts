@@ -196,8 +196,8 @@ export class TimeTrackingClient {
     const url = `${this.baseUrl}${path}${buildQuery(options?.query)}`;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const authMode = options?.authMode ?? "apiKey";
-    if (this.apiKey && (authMode === "apiKey" || authMode === "both")) {
-      headers["x-api-key"] = this.apiKey;
+    if (this.apiKey && (authMode === "apiKey")) {
+      headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
     const response = await this.fetchImpl(url, {
       method: options?.method ?? "GET",
