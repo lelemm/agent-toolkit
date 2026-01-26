@@ -40,6 +40,9 @@ export type ClickUpCustomTaskType = {
   orderindex?: number;
 };
 
+/**
+ * Query parameters for listing tasks from a ClickUp list.
+ */
 export type ListTasksQuery = {
   archived?: boolean;
   page?: number;
@@ -52,6 +55,45 @@ export type ListTasksQuery = {
   tags?: string[];
   due_date_gt?: number;
   due_date_lt?: number;
+};
+
+/**
+ * Query parameters for listing tasks from a ClickUp view.
+ * Views are saved filters/layouts in ClickUp that can be shared across team members.
+ *
+ * @example
+ * ```typescript
+ * const query: ListViewTasksQuery = {
+ *   page: 0,           // First page (0-indexed)
+ * };
+ * const result = await client.listViewTasks("abc-123", query);
+ * ```
+ */
+export type ListViewTasksQuery = {
+  /**
+   * Page number for pagination (0-indexed).
+   * Use in combination with `last_page` from the response to iterate through all tasks.
+   * @default 0
+   */
+  page?: number;
+};
+
+/**
+ * Response from listing tasks in a ClickUp view.
+ * Contains the tasks array and pagination information.
+ */
+export type ListViewTasksResponse = {
+  /**
+   * Array of tasks matching the view's filters and configuration.
+   */
+  tasks: ClickUpTask[];
+
+  /**
+   * Indicates whether this is the last page of results.
+   * When `true`, there are no more tasks to fetch.
+   * When `false`, increment the `page` parameter to fetch more tasks.
+   */
+  last_page: boolean;
 };
 
 const DEFAULT_BASE_URL = "https://api.clickup.com/api/v2";
@@ -129,6 +171,37 @@ export class ClickUpClient {
 
   listTasks(listId: string, query?: ListTasksQuery): Promise<{ tasks: ClickUpTask[] }> {
     return this.request(`/list/${listId}/task`, { query });
+  }
+
+  /**
+   * Lists tasks from a ClickUp view.
+   *
+   * Views are saved filters and layouts that can be shared across team members.
+   * This method retrieves tasks that match the view's configuration.
+   *
+   * @param viewId - The unique identifier of the view (e.g., "abc-123-def")
+   * @param query - Optional query parameters for pagination
+   * @returns Promise resolving to tasks and pagination info
+   *
+   * @example
+   * ```typescript
+   * // Fetch first page of tasks from a view
+   * const result = await client.listViewTasks("abc-123");
+   * console.log(result.tasks);
+   *
+   * // Paginate through all tasks
+   * let page = 0;
+   * let allTasks: ClickUpTask[] = [];
+   * while (true) {
+   *   const result = await client.listViewTasks("abc-123", { page });
+   *   allTasks.push(...result.tasks);
+   *   if (result.last_page) break;
+   *   page++;
+   * }
+   * ```
+   */
+  listViewTasks(viewId: string, query?: ListViewTasksQuery): Promise<ListViewTasksResponse> {
+    return this.request(`/view/${viewId}/task`, { query });
   }
 
   getTask(taskId: string): Promise<ClickUpTask> {

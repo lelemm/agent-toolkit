@@ -197,7 +197,8 @@ export class TimeTrackingClient {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const authMode = options?.authMode ?? "apiKey";
     if (this.apiKey && (authMode === "apiKey")) {
-      headers["Authorization"] = `Bearer ${this.apiKey}`;
+      // The time-tracking API expects an API key header (not a bearer token).
+      headers["x-api-key"] = this.apiKey;
     }
     const response = await this.fetchImpl(url, {
       method: options?.method ?? "GET",
