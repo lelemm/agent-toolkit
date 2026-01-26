@@ -23,6 +23,7 @@ export const ENV_KEYS = {
   GRAPH_BASE_URL: "GRAPH_BASE_URL",
   GRAPH_TENANT_ID: "GRAPH_TENANT_ID",
   GRAPH_CLIENT_ID: "GRAPH_CLIENT_ID",
+  CALENDAR_QUERY_WEBHOOK_URL: "CALENDAR_QUERY_WEBHOOK_URL",
   TIME_TRACKING_BASE_URL: "TIME_TRACKING_BASE_URL",
   TIME_TRACKING_API_KEY: "TIME_TRACKING_API_KEY",
   VIKUNJA_BASE_URL: "VIKUNJA_BASE_URL",
@@ -40,6 +41,10 @@ export type GraphSecrets = {
   baseUrl?: string;
   tenantId?: string;
   clientId?: string;
+};
+
+export type CalendarQuerySecrets = {
+  webhookUrl: string;
 };
 
 export type TimeTrackingSecrets = {
@@ -66,6 +71,12 @@ export const getGraphSecrets = (readEnv: EnvReader = defaultEnvReader): GraphSec
   baseUrl: optionalEnv(ENV_KEYS.GRAPH_BASE_URL, readEnv),
   tenantId: optionalEnv(ENV_KEYS.GRAPH_TENANT_ID, readEnv),
   clientId: optionalEnv(ENV_KEYS.GRAPH_CLIENT_ID, readEnv),
+});
+
+export const getCalendarQuerySecrets = (
+  readEnv: EnvReader = defaultEnvReader
+): CalendarQuerySecrets => ({
+  webhookUrl: requireEnv(ENV_KEYS.CALENDAR_QUERY_WEBHOOK_URL, readEnv),
 });
 
 export const getTimeTrackingSecrets = (

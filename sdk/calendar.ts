@@ -1,807 +1,936 @@
 /**
- * Microsoft Graph Calendar API Client with Device Code Authentication
- * ====================================================================
+ * Microsoft Graph Calendar Query Client (via n8n Webhook)
+ * ========================================================
  *
- * This module provides a GraphCalendarClient that uses OAuth 2.0 Device Code Flow
- * for authentication. This is designed for LLM agents that cannot handle interactive
- * login flows directly.
+ * This module provides a GraphCalendarQueryClient for reading calendar data
+ * through an n8n webhook that proxies requests to Microsoft Graph API.
  *
- * ## Authentication Flow Overview
+ * ## Configuration
  *
- * The device code flow works as follows:
+ * The webhook URL must be provided via the `CALENDAR_QUERY_WEBHOOK_URL` environment variable.
+ * Use `getCalendarQuerySecrets()` from `secrets.ts` to read it.
  *
- * 1. **First API Call (No Tokens)**
- *    - Agent calls any API method (e.g., `listEvents()`)
- *    - No tokens exist in `/workspace/.session/`
- *    - Client initiates device code flow with Microsoft
- *    - Microsoft returns a user code and verification URL
- *    - State is saved to `/workspace/.session/.device_code_state`
- *    - `DeviceCodeAuthRequiredError` is thrown with login instructions
+ * ## How It Works
  *
- * 2. **User Authentication**
- *    - User visits the verification URL (e.g., https://microsoft.com/devicelogin)
- *    - User enters the code (e.g., "ABCD1234")
- *    - User signs in and grants permissions
+ * Instead of authenticating directly with Microsoft Graph, this client sends
+ * requests to an n8n webhook which handles the authentication and forwards
+ * the request to Microsoft Graph.
  *
- * 3. **Subsequent API Call (Pending Flow)**
- *    - Agent retries the API call
- *    - Client reads pending state from `.device_code_state`
- *    - Client polls Microsoft to check if user completed login
- *    - If still pending: throws `DeviceCodeAuthRequiredError` again
- *    - If completed: saves tokens, clears state, proceeds with API call
- *    - If expired/declined: clears state, starts new flow
+ * Request format:
+ * ```
+ * POST <CALENDAR_QUERY_WEBHOOK_URL>
+ * Content-Type: application/json
  *
- * 4. **Normal Operation (Valid Tokens)**
- *    - Agent calls API methods
- *    - Client reads `.access_token` from disk
- *    - If valid (not expired), uses it directly
- *    - If expired, uses `.refresh_token` to get new access token
- *    - If refresh fails, starts new device code flow
+ * {
+ *   "url": "https://graph.microsoft.com/v1.0/me/events?$filter=..."
+ * }
+ * ```
  *
- * ## File Storage
- *
- * All authentication state is stored in `/workspace/.session/` (configurable):
- * - `.access_token` - The current access token (JWT, ~1 hour validity)
- * - `.refresh_token` - The refresh token (used to get new access tokens)
- * - `.device_code_state` - Pending device code flow state (JSON)
+ * The webhook returns the exact response from Microsoft Graph.
  *
  * ## Usage Example
  *
  * ```typescript
- * import { GraphCalendarClient, DeviceCodeAuthRequiredError } from "./calendar";
+ * import { GraphCalendarQueryClient } from "./calendar";
+ * import { getCalendarQuerySecrets } from "./secrets";
  *
- * const client = new GraphCalendarClient({
- *   auth: {
- *     clientId: "your-app-client-id",
- *     tenantId: "your-tenant-id", // or "common" for multi-tenant
- *   },
- * });
+ * const secrets = getCalendarQuerySecrets();
+ * const client = new GraphCalendarQueryClient({ webhookUrl: secrets.webhookUrl });
  *
- * try {
- *   const events = await client.listEvents();
- *   console.log(events);
- * } catch (error) {
- *   if (error instanceof DeviceCodeAuthRequiredError) {
- *     // Display to user:
- *     console.log(`Please visit: ${error.verificationUri}`);
- *     console.log(`Enter code: ${error.userCode}`);
- *     console.log(`Code expires at: ${error.expiresAt}`);
- *     // Retry later after user completes login
- *   } else {
- *     throw error;
- *   }
- * }
+ * // Get events for today
+ * const todayEvents = await client.getEventsToday();
+ *
+ * // Search events by subject
+ * const meetings = await client.getEventsBySubject("Team Sync");
+ *
+ * // Get a specific event by ID
+ * const event = await client.getEventById("AAMkAGI2...");
+ *
+ * // List all calendars
+ * const calendars = await client.listCalendars();
  * ```
  */
 
-export type GraphDeviceCodeAuthConfig = {
-  /**
-   * Microsoft Entra application (public client) ID.
-   * This is the only credential required for device-code flow.
-   */
-  clientId: string;
-  /**
-   * Tenant to authenticate against. Defaults to "common".
-   * Examples: "common", "organizations", "consumers", or a tenant GUID.
-   */
-  tenantId?: string;
-  /**
-   * Delegated scopes. MUST include "offline_access" if you want refresh tokens.
-   * Defaults to calendar-friendly delegated scopes.
-   */
-  scopes?: string[];
-};
-
-export type GraphTokenStorageConfig = {
-  /**
-   * Directory where `.access_token`, `.refresh_token`, and `.device_code_state` will be stored.
-   * Defaults to "/workspace/.session".
-   */
-  dir?: string;
-  accessTokenFilename?: string; // default ".access_token"
-  refreshTokenFilename?: string; // default ".refresh_token"
-  deviceCodeStateFilename?: string; // default ".device_code_state"
-};
-
-export type GraphClientConfig = {
-  baseUrl?: string;
-  /**
-   * Device-code auth config (public client). Tokens are stored in /workspace/.session/.
-   * LLM agents should NOT provide accessToken directly - use this auth config instead.
-   */
-  auth: GraphDeviceCodeAuthConfig;
-  tokenStorage?: GraphTokenStorageConfig;
-  fetchImpl?: typeof fetch;
-};
+// ============================================================================
+// Microsoft Graph Types
+// ============================================================================
 
 /**
- * Error thrown when device code authentication is required.
- * The LLM agent should catch this and display the login instructions to the user.
+ * Date/time with timezone information from Microsoft Graph.
  */
-export class DeviceCodeAuthRequiredError extends Error {
-  constructor(
-    public readonly userCode: string,
-    public readonly verificationUri: string,
-    public readonly verificationUriComplete: string | undefined,
-    public readonly expiresAt: string,
-    message?: string
-  ) {
-    super(
-      message ??
-        `Authentication required. Visit ${verificationUri} and enter code: ${userCode}`
-    );
-    this.name = "DeviceCodeAuthRequiredError";
-  }
-}
-
-/**
- * State persisted to disk during an active device code flow.
- */
-export type DeviceCodeState = {
-  deviceCode: string;
-  userCode: string;
-  verificationUri: string;
-  verificationUriComplete?: string;
-  intervalSeconds: number;
-  expiresAt: string; // ISO date
-};
-
-export type DateTimeTimeZone = {
+export type GraphDateTimeTimeZone = {
+  /** Date and time in ISO 8601 format (e.g., "2024-01-15T10:00:00.0000000") */
   dateTime: string;
+  /** IANA timezone name (e.g., "UTC", "America/New_York", "Pacific Standard Time") */
   timeZone: string;
 };
 
-export type GraphCalendar = {
-  id: string;
+/**
+ * Email address information.
+ */
+export type GraphEmailAddress = {
+  /** Display name of the person */
   name?: string;
-  color?: string;
-  isDefaultCalendar?: boolean;
-  owner?: { name?: string; address?: string };
+  /** Email address */
+  address: string;
 };
 
+/**
+ * An attendee of a calendar event.
+ */
 export type GraphAttendee = {
-  emailAddress: { name?: string; address: string };
+  /** Email address of the attendee */
+  emailAddress: GraphEmailAddress;
+  /** Type of attendee */
   type?: "required" | "optional" | "resource";
+  /** Response status of the attendee */
+  status?: {
+    response?: "none" | "organizer" | "tentativelyAccepted" | "accepted" | "declined" | "notResponded";
+    time?: string;
+  };
 };
 
-export type GraphEvent = {
-  id?: string;
-  subject?: string;
-  body?: { contentType: "text" | "html"; content: string };
-  start?: DateTimeTimeZone;
-  end?: DateTimeTimeZone;
-  attendees?: GraphAttendee[];
-  location?: { displayName?: string };
-  organizer?: { emailAddress?: { name?: string; address?: string } };
-  isAllDay?: boolean;
+/**
+ * Location information for an event.
+ */
+export type GraphLocation = {
+  /** Display name of the location */
+  displayName?: string;
+  /** Location type */
+  locationType?: "default" | "conferenceRoom" | "homeAddress" | "businessAddress" | "geoCoordinates" | "streetAddress" | "hotel" | "restaurant" | "localBusiness" | "postalAddress";
+  /** Unique identifier for the location */
+  uniqueId?: string;
+  /** Type of unique identifier */
+  uniqueIdType?: "unknown" | "locationStore" | "directory" | "private" | "bing";
+  /** Physical address */
+  address?: {
+    street?: string;
+    city?: string;
+    state?: string;
+    countryOrRegion?: string;
+    postalCode?: string;
+  };
+  /** Geographic coordinates */
+  coordinates?: {
+    latitude?: number;
+    longitude?: number;
+  };
 };
 
-export type CalendarViewQuery = {
-  startDateTime: string;
-  endDateTime: string;
-  top?: number;
-  skip?: number;
-  orderby?: string;
+/**
+ * Body content of an event (description).
+ */
+export type GraphItemBody = {
+  /** Content type: text or HTML */
+  contentType: "text" | "html";
+  /** The actual content */
+  content: string;
 };
 
-export type ScheduleRequest = {
-  schedules: string[];
-  startTime: DateTimeTimeZone;
-  endTime: DateTimeTimeZone;
-  availabilityViewInterval?: number;
+/**
+ * Response status for a meeting.
+ */
+export type GraphResponseStatus = {
+  /** The response type */
+  response?: "none" | "organizer" | "tentativelyAccepted" | "accepted" | "declined" | "notResponded";
+  /** Time of the response */
+  time?: string;
 };
 
-export type ScheduleResponse = {
-  value: Array<{
-    scheduleId: string;
-    availabilityView?: string;
-    scheduleItems?: Array<{
-      status: string;
-      start: DateTimeTimeZone;
-      end: DateTimeTimeZone;
-      subject?: string;
-      location?: string;
-    }>;
+/**
+ * Online meeting information.
+ */
+export type GraphOnlineMeetingInfo = {
+  /** Join URL for the online meeting */
+  joinUrl?: string;
+  /** Conference ID */
+  conferenceId?: string;
+  /** Toll number for dial-in */
+  tollNumber?: string;
+  /** Toll-free number for dial-in */
+  tollFreeNumber?: string;
+  /** Quick dial info */
+  quickDial?: string;
+  /** Phones for the meeting */
+  phones?: Array<{
+    number?: string;
+    type?: "home" | "business" | "mobile" | "other" | "assistant" | "homeFax" | "businessFax" | "otherFax" | "pager" | "radio";
   }>;
 };
 
-const DEFAULT_BASE_URL = "https://graph.microsoft.com/v1.0";
+/**
+ * Recurrence pattern for recurring events.
+ */
+export type GraphRecurrencePattern = {
+  /** Type of recurrence */
+  type: "daily" | "weekly" | "absoluteMonthly" | "relativeMonthly" | "absoluteYearly" | "relativeYearly";
+  /** Interval between occurrences */
+  interval: number;
+  /** Days of the week (for weekly recurrence) */
+  daysOfWeek?: Array<"sunday" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday">;
+  /** Day of month (for monthly/yearly recurrence) */
+  dayOfMonth?: number;
+  /** Month (for yearly recurrence) */
+  month?: number;
+  /** First day of week */
+  firstDayOfWeek?: "sunday" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday";
+  /** Index of the week in the month */
+  index?: "first" | "second" | "third" | "fourth" | "last";
+};
 
-const DEFAULT_DEVICE_CODE_SCOPES = [
-  "offline_access",
-  "https://graph.microsoft.com/.default"
-];
+/**
+ * Recurrence range for recurring events.
+ */
+export type GraphRecurrenceRange = {
+  /** Type of range */
+  type: "endDate" | "noEnd" | "numbered";
+  /** Start date of recurrence */
+  startDate: string;
+  /** End date (for endDate type) */
+  endDate?: string;
+  /** Number of occurrences (for numbered type) */
+  numberOfOccurrences?: number;
+  /** Recurrence timezone */
+  recurrenceTimeZone?: string;
+};
 
-const buildQuery = (query?: Record<string, unknown>): string => {
-  if (!query) return "";
+/**
+ * Pattern recurrence combining pattern and range.
+ */
+export type GraphPatternedRecurrence = {
+  pattern: GraphRecurrencePattern;
+  range: GraphRecurrenceRange;
+};
+
+/**
+ * A calendar event from Microsoft Graph.
+ */
+export type GraphEvent = {
+  /** Unique identifier for the event */
+  id?: string;
+  /** Subject/title of the event */
+  subject?: string;
+  /** Body/description of the event */
+  body?: GraphItemBody;
+  /** Body preview (plain text snippet) */
+  bodyPreview?: string;
+  /** Start date/time */
+  start?: GraphDateTimeTimeZone;
+  /** End date/time */
+  end?: GraphDateTimeTimeZone;
+  /** Whether this is an all-day event */
+  isAllDay?: boolean;
+  /** Whether this event has been cancelled */
+  isCancelled?: boolean;
+  /** Whether this is a draft */
+  isDraft?: boolean;
+  /** Whether this is an online meeting */
+  isOnlineMeeting?: boolean;
+  /** Whether organizer is the current user */
+  isOrganizer?: boolean;
+  /** Whether reminder is on */
+  isReminderOn?: boolean;
+  /** Location of the event */
+  location?: GraphLocation;
+  /** Additional locations */
+  locations?: GraphLocation[];
+  /** Attendees of the event */
+  attendees?: GraphAttendee[];
+  /** Organizer of the event */
+  organizer?: {
+    emailAddress?: GraphEmailAddress;
+  };
+  /** Online meeting provider */
+  onlineMeetingProvider?: "unknown" | "teamsForBusiness" | "skypeForBusiness" | "skypeForConsumer";
+  /** Online meeting URL */
+  onlineMeetingUrl?: string;
+  /** Detailed online meeting info */
+  onlineMeeting?: GraphOnlineMeetingInfo;
+  /** Recurrence pattern */
+  recurrence?: GraphPatternedRecurrence;
+  /** Minutes before event to show reminder */
+  reminderMinutesBeforeStart?: number;
+  /** Response status (for meeting invites) */
+  responseStatus?: GraphResponseStatus;
+  /** Required response from attendees */
+  responseRequested?: boolean;
+  /** Series master ID (for recurring events) */
+  seriesMasterId?: string;
+  /** Show as status */
+  showAs?: "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
+  /** Event type */
+  type?: "singleInstance" | "occurrence" | "exception" | "seriesMaster";
+  /** Web link to open in Outlook */
+  webLink?: string;
+  /** Importance */
+  importance?: "low" | "normal" | "high";
+  /** Sensitivity */
+  sensitivity?: "normal" | "personal" | "private" | "confidential";
+  /** Categories */
+  categories?: string[];
+  /** When the event was created */
+  createdDateTime?: string;
+  /** When the event was last modified */
+  lastModifiedDateTime?: string;
+  /** Original start timezone */
+  originalStartTimeZone?: string;
+  /** Original end timezone */
+  originalEndTimeZone?: string;
+  /** ICalendar UID */
+  iCalUId?: string;
+  /** Change key for concurrency */
+  changeKey?: string;
+};
+
+/**
+ * A calendar from Microsoft Graph.
+ */
+export type GraphCalendar = {
+  /** Unique identifier for the calendar */
+  id?: string;
+  /** Name of the calendar */
+  name?: string;
+  /** Color of the calendar */
+  color?: "auto" | "lightBlue" | "lightGreen" | "lightOrange" | "lightGray" | "lightYellow" | "lightTeal" | "lightPink" | "lightBrown" | "lightRed" | "maxColor";
+  /** Hex color code */
+  hexColor?: string;
+  /** Whether this is the default calendar */
+  isDefaultCalendar?: boolean;
+  /** Whether the calendar can be edited */
+  canEdit?: boolean;
+  /** Whether the calendar can share */
+  canShare?: boolean;
+  /** Whether the calendar can view private items */
+  canViewPrivateItems?: boolean;
+  /** Whether this is a removable calendar */
+  isRemovable?: boolean;
+  /** Whether this is a tallying responses calendar */
+  isTallyingResponses?: boolean;
+  /** Owner of the calendar */
+  owner?: GraphEmailAddress;
+  /** Change key for concurrency */
+  changeKey?: string;
+  /** Allowed online meeting providers */
+  allowedOnlineMeetingProviders?: string[];
+  /** Default online meeting provider */
+  defaultOnlineMeetingProvider?: string;
+};
+
+/**
+ * Response wrapper for collections from Microsoft Graph.
+ */
+export type GraphCollectionResponse<T> = {
+  /** The collection of items */
+  value: T[];
+  /** Link to next page of results (if paginated) */
+  "@odata.nextLink"?: string;
+  /** Total count (if $count=true) */
+  "@odata.count"?: number;
+  /** Context URL */
+  "@odata.context"?: string;
+};
+
+// ============================================================================
+// Client Configuration
+// ============================================================================
+
+export type GraphCalendarQueryClientConfig = {
+  /**
+   * URL for the n8n webhook that proxies requests to Microsoft Graph.
+   * Required. Set via CALENDAR_QUERY_WEBHOOK_URL environment variable.
+   */
+  webhookUrl: string;
+  /**
+   * Base URL for Microsoft Graph API (used to construct query URLs).
+   * Defaults to "https://graph.microsoft.com/v1.0"
+   */
+  graphBaseUrl?: string;
+  /**
+   * Custom fetch implementation (for testing).
+   */
+  fetchImpl?: typeof fetch;
+};
+
+// ============================================================================
+// Query Options
+// ============================================================================
+
+export type EventQueryOptions = {
+  /** Maximum number of events to return */
+  top?: number;
+  /** Number of events to skip (for pagination) */
+  skip?: number;
+  /** Order by clause (e.g., "start/dateTime asc") */
+  orderBy?: string;
+  /** Select specific fields (comma-separated or array) */
+  select?: string | string[];
+  /** Expand related entities */
+  expand?: string;
+  /** Custom filter (OData filter expression) */
+  filter?: string;
+};
+
+export type CalendarViewOptions = {
+  /** Start of the time range (ISO 8601 date/time) */
+  startDateTime: string;
+  /** End of the time range (ISO 8601 date/time) */
+  endDateTime: string;
+  /** Maximum number of events to return */
+  top?: number;
+  /** Number of events to skip (for pagination) */
+  skip?: number;
+  /** Order by clause */
+  orderBy?: string;
+  /** Select specific fields */
+  select?: string | string[];
+};
+
+// ============================================================================
+// Client Implementation
+// ============================================================================
+
+const DEFAULT_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0";
+
+/**
+ * Builds OData query string from options.
+ */
+const buildODataQuery = (options?: EventQueryOptions): string => {
+  if (!options) return "";
+  
   const params = new URLSearchParams();
-  Object.entries(query).forEach(([key, value]) => {
-    if (value === undefined || value === null) return;
-    params.set(key, String(value));
-  });
+  
+  if (options.top !== undefined) params.set("$top", String(options.top));
+  if (options.skip !== undefined) params.set("$skip", String(options.skip));
+  if (options.orderBy) params.set("$orderby", options.orderBy);
+  if (options.filter) params.set("$filter", options.filter);
+  if (options.expand) params.set("$expand", options.expand);
+  
+  if (options.select) {
+    const selectStr = Array.isArray(options.select) ? options.select.join(",") : options.select;
+    params.set("$select", selectStr);
+  }
+  
   const qs = params.toString();
   return qs ? `?${qs}` : "";
 };
 
-type GraphErrorResponse = {
-  error?: {
-    message?: string;
-  };
-};
-
-const toErrorMessage = async (response: Response): Promise<string> => {
-  try {
-    const data = (await response.json()) as GraphErrorResponse;
-    if (data?.error?.message) return String(data.error.message);
-    if (data?.error) return JSON.stringify(data.error);
-  } catch {
-    // ignore
-  }
-  return `${response.status} ${response.statusText}`.trim();
-};
-
-type GraphDeviceCodeStartResponse = {
-  device_code: string;
-  user_code: string;
-  verification_uri: string;
-  verification_uri_complete?: string;
-  expires_in: number;
-  interval?: number;
-  message?: string;
-};
-
-type GraphTokenResponse = {
-  token_type?: string;
-  scope?: string;
-  expires_in?: number;
-  ext_expires_in?: number;
-  access_token?: string;
-  refresh_token?: string;
-  error?: string;
-  error_description?: string;
-  error_codes?: number[];
-  timestamp?: string;
-  trace_id?: string;
-  correlation_id?: string;
-  error_uri?: string;
-};
-
-type DeviceCodeCheckResult =
-  | { status: "pending"; nextPollInSeconds: number; message?: string }
-  | { status: "completed"; accessToken: string }
-  | { status: "declined"; error: string }
-  | { status: "expired"; error: string }
-  | { status: "error"; error: string };
-
-const nowSeconds = () => Math.floor(Date.now() / 1000);
-
-const base64UrlDecodeToString = (input: string): string => {
-  const padded = input.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(input.length / 4) * 4, "=");
-  // Node and modern runtimes support atob; but Node may not in older versions.
-  if (typeof atob === "function") return atob(padded);
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-var-requires
-  const buf = Buffer.from(padded, "base64");
-  return buf.toString("utf8");
-};
-
-const tryGetJwtExpSeconds = (token: string): number | undefined => {
-  const parts = token.split(".");
-  if (parts.length < 2) return undefined;
-  try {
-    const payload = JSON.parse(base64UrlDecodeToString(parts[1])) as { exp?: number };
-    if (typeof payload?.exp === "number") return payload.exp;
-  } catch {
-    // ignore
-  }
-  return undefined;
-};
-
-const isLikelyValidAccessToken = (token: string, skewSeconds = 60): boolean => {
-  const exp = tryGetJwtExpSeconds(token);
-  if (!exp) return false;
-  return exp > nowSeconds() + skewSeconds;
-};
-
-const formUrlEncode = (body: Record<string, string>): string => {
+/**
+ * Builds calendar view query string.
+ */
+const buildCalendarViewQuery = (options: CalendarViewOptions): string => {
   const params = new URLSearchParams();
-  Object.entries(body).forEach(([k, v]) => params.set(k, v));
-  return params.toString();
-};
-
-const getAuthorityBase = (tenantId?: string) =>
-  `https://login.microsoftonline.com/${tenantId ?? "common"}/oauth2/v2.0`;
-
-const normalizeScopes = (scopes?: string[]) => (scopes?.length ? scopes : DEFAULT_DEVICE_CODE_SCOPES);
-
-type TokenPair = { accessToken?: string; refreshToken?: string };
-
-const DEFAULT_SESSION_DIR = "/workspace/.session";
-
-const resolveTokenPaths = async (storage?: GraphTokenStorageConfig) => {
-  const dir = storage?.dir ?? DEFAULT_SESSION_DIR;
-  const accessName = storage?.accessTokenFilename ?? ".access_token";
-  const refreshName = storage?.refreshTokenFilename ?? ".refresh_token";
-  const stateName = storage?.deviceCodeStateFilename ?? ".device_code_state";
-
-  // Dynamic import so this file stays usable in non-Node environments until token persistence is used.
-  const pathMod = await import("node:path");
-  return {
-    dir,
-    accessPath: pathMod.join(dir, accessName),
-    refreshPath: pathMod.join(dir, refreshName),
-    statePath: pathMod.join(dir, stateName),
-  };
-};
-
-const ensureDirectoryExists = async (dir: string): Promise<void> => {
-  const fs = await import("node:fs/promises");
-  try {
-    await fs.mkdir(dir, { recursive: true });
-  } catch {
-    // ignore if exists
+  
+  params.set("startDateTime", options.startDateTime);
+  params.set("endDateTime", options.endDateTime);
+  
+  if (options.top !== undefined) params.set("$top", String(options.top));
+  if (options.skip !== undefined) params.set("$skip", String(options.skip));
+  if (options.orderBy) params.set("$orderby", options.orderBy);
+  
+  if (options.select) {
+    const selectStr = Array.isArray(options.select) ? options.select.join(",") : options.select;
+    params.set("$select", selectStr);
   }
-};
-
-const readTextFileIfExists = async (path: string): Promise<string | undefined> => {
-  try {
-    const fs = await import("node:fs/promises");
-    const value = await fs.readFile(path, "utf8");
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-const writeTextFile = async (path: string, value: string): Promise<void> => {
-  const fs = await import("node:fs/promises");
-  await fs.writeFile(path, `${value.trim()}\n`, "utf8");
-};
-
-const deleteFileIfExists = async (path: string): Promise<void> => {
-  try {
-    const fs = await import("node:fs/promises");
-    await fs.unlink(path);
-  } catch {
-    // ignore
-  }
+  
+  return `?${params.toString()}`;
 };
 
 /**
- * Internal class that handles the device code authentication flow.
- *
- * This class manages:
- * - Starting new device code flows
- * - Polling for completion
- * - Token refresh
- * - Persisting tokens and state to disk
+ * Escapes a string for use in OData filter expressions.
  */
-class GraphDeviceCodeAuth {
-  private clientId: string;
-  private tenantId?: string;
-  private scopes: string[];
+const escapeODataString = (value: string): string => {
+  return value.replace(/'/g, "''");
+};
+
+/**
+ * Formats a date for OData filter (ISO 8601 format).
+ */
+const formatDateForOData = (date: Date | string): string => {
+  if (typeof date === "string") return date;
+  return date.toISOString();
+};
+
+/**
+ * Client for querying Microsoft Graph Calendar data through n8n webhook.
+ *
+ * This client sends requests to an n8n webhook which handles authentication
+ * and proxies the request to Microsoft Graph API.
+ *
+ * @example
+ * ```typescript
+ * import { GraphCalendarQueryClient } from "./calendar";
+ * import { getCalendarQuerySecrets } from "./secrets";
+ *
+ * const secrets = getCalendarQuerySecrets();
+ * const client = new GraphCalendarQueryClient({ webhookUrl: secrets.webhookUrl });
+ * ```
+ */
+export class GraphCalendarQueryClient {
+  private webhookUrl: string;
+  private graphBaseUrl: string;
   private fetchImpl: typeof fetch;
-  private tokenStorage?: GraphTokenStorageConfig;
 
-  constructor(config: {
-    auth: GraphDeviceCodeAuthConfig;
-    fetchImpl: typeof fetch;
-    tokenStorage?: GraphTokenStorageConfig;
-  }) {
-    this.clientId = config.auth.clientId;
-    this.tenantId = config.auth.tenantId;
-    this.scopes = normalizeScopes(config.auth.scopes);
-    this.fetchImpl = config.fetchImpl;
-    this.tokenStorage = config.tokenStorage;
-  }
-
-  private async tokenPaths() {
-    return resolveTokenPaths(this.tokenStorage);
-  }
-
-  private scopeString() {
-    return this.scopes.join(" ");
+  constructor(config: GraphCalendarQueryClientConfig) {
+    this.webhookUrl = config.webhookUrl;
+    this.graphBaseUrl = config.graphBaseUrl ?? DEFAULT_GRAPH_BASE_URL;
+    this.fetchImpl = config.fetchImpl ?? fetch;
   }
 
   /**
-   * Initiates a new device code flow with Microsoft.
-   *
-   * This method:
-   * 1. Calls Microsoft's /devicecode endpoint
-   * 2. Receives a user_code and verification_uri
-   * 3. Persists the state to .device_code_state file
-   * 4. Returns the state for the caller to throw DeviceCodeAuthRequiredError
-   *
-   * The user must then visit the verification_uri and enter the user_code
-   * to complete authentication.
+   * Sends a query to the n8n webhook.
+   * @param graphUrl - Full Microsoft Graph URL to query
+   * @returns The response from Microsoft Graph
    */
-  private async startDeviceCodeLogin(): Promise<DeviceCodeState> {
-    const base = getAuthorityBase(this.tenantId);
-    const response = await this.fetchImpl(`${base}/devicecode`, {
+  private async query<T>(graphUrl: string): Promise<T> {
+    const response = await this.fetchImpl(this.webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: formUrlEncode({ client_id: this.clientId, scope: this.scopeString() }),
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: graphUrl }),
     });
+
     if (!response.ok) {
-      throw new Error(await toErrorMessage(response));
+      const errorText = await response.text();
+      throw new Error(`Calendar query failed: ${response.status} ${response.statusText} - ${errorText}`);
     }
-    const data = (await response.json()) as GraphDeviceCodeStartResponse;
-    const intervalSeconds = typeof data.interval === "number" && data.interval > 0 ? data.interval : 5;
-    const state: DeviceCodeState = {
-      deviceCode: data.device_code,
-      userCode: data.user_code,
-      verificationUri: data.verification_uri,
-      verificationUriComplete: data.verification_uri_complete,
-      intervalSeconds,
-      expiresAt: new Date(Date.now() + data.expires_in * 1000).toISOString(),
-    };
-    await this.persistDeviceCodeState(state);
-    return state;
+
+    return (await response.json()) as T;
+  }
+
+  // ==========================================================================
+  // Calendar Methods
+  // ==========================================================================
+
+  /**
+   * Lists all calendars for the current user.
+   *
+   * @example
+   * ```typescript
+   * const calendars = await client.listCalendars();
+   * calendars.value.forEach(cal => console.log(cal.name));
+   * ```
+   */
+  async listCalendars(): Promise<GraphCollectionResponse<GraphCalendar>> {
+    const url = `${this.graphBaseUrl}/me/calendars`;
+    return this.query(url);
   }
 
   /**
-   * Polls Microsoft once to check if the user has completed the device code flow.
+   * Gets a specific calendar by ID.
    *
-   * This method does NOT actively poll in a loop. It checks once and returns:
-   * - "completed": User authenticated, tokens saved to disk
-   * - "pending": User hasn't completed yet, caller should retry later
-   * - "expired": The device code expired (15 min timeout), need to start over
-   * - "declined": User declined the authorization
-   * - "error": Some other error occurred
+   * @param calendarId - The calendar ID
    *
-   * On "completed", tokens are saved to .access_token and .refresh_token,
-   * and the .device_code_state file is deleted.
+   * @example
+   * ```typescript
+   * const calendar = await client.getCalendar("AAMkAGI2...");
+   * console.log(calendar.name);
+   * ```
    */
-  private async checkDeviceCodeResult(state: DeviceCodeState): Promise<DeviceCodeCheckResult> {
-    const base = getAuthorityBase(this.tenantId);
-
-    const response = await this.fetchImpl(`${base}/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: formUrlEncode({
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-        client_id: this.clientId,
-        device_code: state.deviceCode,
-      }),
-    });
-
-    const data = (await response.json()) as GraphTokenResponse;
-    if (response.ok && data.access_token) {
-      // Success! User completed the flow. Save tokens and clean up state.
-      const { dir, accessPath, refreshPath } = await this.tokenPaths();
-      await ensureDirectoryExists(dir);
-      await writeTextFile(accessPath, data.access_token);
-      if (data.refresh_token) await writeTextFile(refreshPath, data.refresh_token);
-      await this.clearDeviceCodeState();
-      return { status: "completed", accessToken: data.access_token };
-    }
-
-    const err = String(data.error ?? "unknown_error");
-    if (err === "authorization_pending" || err === "slow_down") {
-      // User hasn't completed the flow yet - this is expected
-      return { status: "pending", nextPollInSeconds: err === "slow_down" ? state.intervalSeconds + 5 : state.intervalSeconds };
-    }
-    if (err === "expired_token") return { status: "expired", error: data.error_description ?? err };
-    if (err === "authorization_declined") return { status: "declined", error: data.error_description ?? err };
-
-    return { status: "error", error: data.error_description ?? err };
+  async getCalendar(calendarId: string): Promise<GraphCalendar> {
+    const url = `${this.graphBaseUrl}/me/calendars/${calendarId}`;
+    return this.query(url);
   }
 
-  private async readTokensFromDisk(): Promise<TokenPair> {
-    const { accessPath, refreshPath } = await this.tokenPaths();
-    const [accessToken, refreshToken] = await Promise.all([
-      readTextFileIfExists(accessPath),
-      readTextFileIfExists(refreshPath),
-    ]);
-    return { accessToken, refreshToken };
+  // ==========================================================================
+  // Event Query Methods
+  // ==========================================================================
+
+  /**
+   * Lists events with optional filtering and pagination.
+   *
+   * @param calendarId - Optional calendar ID (defaults to primary calendar)
+   * @param options - Query options (top, skip, filter, orderBy, select)
+   *
+   * @example
+   * ```typescript
+   * // Get first 10 events ordered by start time
+   * const events = await client.listEvents(undefined, {
+   *   top: 10,
+   *   orderBy: "start/dateTime asc"
+   * });
+   * ```
+   */
+  async listEvents(
+    calendarId?: string,
+    options?: EventQueryOptions
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const path = calendarId
+      ? `/me/calendars/${calendarId}/events`
+      : "/me/events";
+    const url = `${this.graphBaseUrl}${path}${buildODataQuery(options)}`;
+    return this.query(url);
   }
 
-  private async persistTokensToDisk(tokens: TokenPair): Promise<void> {
-    const { dir, accessPath, refreshPath } = await this.tokenPaths();
-    await ensureDirectoryExists(dir);
-    if (tokens.accessToken) await writeTextFile(accessPath, tokens.accessToken);
-    if (tokens.refreshToken) await writeTextFile(refreshPath, tokens.refreshToken);
+  /**
+   * Gets a calendar view (expanded recurring events) for a date range.
+   * This is the recommended way to get events for a specific time period.
+   *
+   * @param options - Must include startDateTime and endDateTime
+   * @param calendarId - Optional calendar ID (defaults to primary calendar)
+   *
+   * @example
+   * ```typescript
+   * // Get all events for this week
+   * const events = await client.getCalendarView({
+   *   startDateTime: "2024-01-15T00:00:00Z",
+   *   endDateTime: "2024-01-21T23:59:59Z",
+   *   top: 50,
+   *   orderBy: "start/dateTime asc"
+   * });
+   * ```
+   */
+  async getCalendarView(
+    options: CalendarViewOptions,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const path = calendarId
+      ? `/me/calendars/${calendarId}/calendarView`
+      : "/me/calendarView";
+    const url = `${this.graphBaseUrl}${path}${buildCalendarViewQuery(options)}`;
+    return this.query(url);
   }
 
-  private async clearTokensOnDisk(): Promise<void> {
-    const { accessPath, refreshPath } = await this.tokenPaths();
-    await Promise.all([deleteFileIfExists(accessPath), deleteFileIfExists(refreshPath)]);
+  /**
+   * Gets a specific event by ID.
+   *
+   * @param eventId - The event ID
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * const event = await client.getEventById("AAMkAGI2...");
+   * console.log(event.subject, event.start?.dateTime);
+   * ```
+   */
+  async getEventById(eventId: string, calendarId?: string): Promise<GraphEvent> {
+    const path = calendarId
+      ? `/me/calendars/${calendarId}/events/${eventId}`
+      : `/me/events/${eventId}`;
+    const url = `${this.graphBaseUrl}${path}`;
+    return this.query(url);
   }
 
-  private async readDeviceCodeState(): Promise<DeviceCodeState | undefined> {
-    const { statePath } = await this.tokenPaths();
-    const content = await readTextFileIfExists(statePath);
-    if (!content) return undefined;
-    try {
-      return JSON.parse(content) as DeviceCodeState;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async persistDeviceCodeState(state: DeviceCodeState): Promise<void> {
-    const { dir, statePath } = await this.tokenPaths();
-    await ensureDirectoryExists(dir);
-    await writeTextFile(statePath, JSON.stringify(state, null, 2));
-  }
-
-  private async clearDeviceCodeState(): Promise<void> {
-    const { statePath } = await this.tokenPaths();
-    await deleteFileIfExists(statePath);
-  }
-
-  private isDeviceCodeStateExpired(state: DeviceCodeState): boolean {
-    return new Date(state.expiresAt).getTime() < Date.now();
-  }
-
-  private async refreshOnce(refreshToken: string): Promise<TokenPair> {
-    const base = getAuthorityBase(this.tenantId);
-    const response = await this.fetchImpl(`${base}/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: formUrlEncode({
-        grant_type: "refresh_token",
-        client_id: this.clientId,
-        refresh_token: refreshToken,
-        scope: this.scopeString(),
-      }),
-    });
-    const data = (await response.json()) as GraphTokenResponse;
-    if (!response.ok || !data.access_token) {
-      const err = data.error_description ?? data.error ?? `${response.status} ${response.statusText}`.trim();
-      throw new Error(String(err));
-    }
-    return { accessToken: data.access_token, refreshToken: data.refresh_token ?? refreshToken };
-  }
-
-  private throwDeviceCodeAuthRequired(state: DeviceCodeState): never {
-    throw new DeviceCodeAuthRequiredError(
-      state.userCode,
-      state.verificationUri,
-      state.verificationUriComplete,
-      state.expiresAt,
-      `Authentication required. Visit ${state.verificationUri} and enter code: ${state.userCode}`
+  /**
+   * Gets events within a date range using calendarView.
+   * This properly expands recurring events.
+   *
+   * @param startDate - Start date (ISO string or Date object)
+   * @param endDate - End date (ISO string or Date object)
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Get events for today
+   * const today = new Date();
+   * const tomorrow = new Date(today);
+   * tomorrow.setDate(tomorrow.getDate() + 1);
+   *
+   * const events = await client.getEventsByDateRange(
+   *   today.toISOString(),
+   *   tomorrow.toISOString()
+   * );
+   * ```
+   */
+  async getEventsByDateRange(
+    startDate: string | Date,
+    endDate: string | Date,
+    options?: Omit<CalendarViewOptions, "startDateTime" | "endDateTime">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    return this.getCalendarView(
+      {
+        startDateTime: formatDateForOData(startDate),
+        endDateTime: formatDateForOData(endDate),
+        ...options,
+      },
+      calendarId
     );
   }
 
   /**
-   * Main entry point for getting a valid access token.
+   * Gets events for today.
    *
-   * This method implements the full authentication flow:
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
    *
+   * @example
+   * ```typescript
+   * const todayEvents = await client.getEventsToday();
+   * console.log(`You have ${todayEvents.value.length} events today`);
    * ```
-   * ┌─────────────────────────────────────────────────────────────────┐
-   * │                    getValidAccessToken()                        │
-   * └─────────────────────────────────────────────────────────────────┘
-   *                              │
-   *                              ▼
-   *              ┌───────────────────────────────┐
-   *              │ Step 1: Check .access_token   │
-   *              │ Is it valid (not expired)?    │
-   *              └───────────────────────────────┘
-   *                     │              │
-   *                    YES            NO
-   *                     │              │
-   *                     ▼              ▼
-   *              ┌──────────┐  ┌───────────────────────────┐
-   *              │ Return   │  │ Step 2: Check .refresh_token │
-   *              │ token    │  │ Try to refresh access token  │
-   *              └──────────┘  └───────────────────────────┘
-   *                                   │              │
-   *                               SUCCESS         FAILED
-   *                                   │              │
-   *                                   ▼              ▼
-   *                            ┌──────────┐  ┌───────────────────────────┐
-   *                            │ Return   │  │ Step 3: Check .device_code_state │
-   *                            │ token    │  │ Is there a pending flow?         │
-   *                            └──────────┘  └───────────────────────────┘
-   *                                                 │              │
-   *                                               YES             NO
-   *                                                 │              │
-   *                                                 ▼              │
-   *                                   ┌─────────────────────┐      │
-   *                                   │ Poll once: did user │      │
-   *                                   │ complete the flow?  │      │
-   *                                   └─────────────────────┘      │
-   *                                      │       │       │         │
-   *                                 COMPLETED  PENDING  FAILED     │
-   *                                      │       │       │         │
-   *                                      ▼       │       ▼         │
-   *                               ┌──────────┐   │  ┌──────────┐   │
-   *                               │ Return   │   │  │ Clear    │   │
-   *                               │ token    │   │  │ state    │   │
-   *                               └──────────┘   │  └──────────┘   │
-   *                                              │       │         │
-   *                                              ▼       ▼         ▼
-   *                                   ┌─────────────────────────────────┐
-   *                                   │ Step 4: Start new device code   │
-   *                                   │ flow, save state, throw error   │
-   *                                   │ with login instructions         │
-   *                                   └─────────────────────────────────┘
-   *                                                    │
-   *                                                    ▼
-   *                                   ┌─────────────────────────────────┐
-   *                                   │ throw DeviceCodeAuthRequiredError │
-   *                                   │ (userCode, verificationUri, ...)  │
-   *                                   └─────────────────────────────────┘
-   * ```
-   *
-   * @throws {DeviceCodeAuthRequiredError} When user authentication is required.
-   *         The error contains `userCode` and `verificationUri` for the user.
    */
-  async getValidAccessToken(): Promise<string> {
-    // ══════════════════════════════════════════════════════════════════════
-    // Step 1: Try existing access token from .access_token file
-    // ══════════════════════════════════════════════════════════════════════
-    const tokens = await this.readTokensFromDisk();
-    if (tokens.accessToken && isLikelyValidAccessToken(tokens.accessToken)) {
-      // Token exists and is not expired (with 60s buffer) - use it directly
-      return tokens.accessToken;
-    }
+  async getEventsToday(
+    options?: Omit<CalendarViewOptions, "startDateTime" | "endDateTime">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const today = new Date();
+    const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0);
+    const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59);
 
-    // ══════════════════════════════════════════════════════════════════════
-    // Step 2: Try to refresh using .refresh_token file
-    // ══════════════════════════════════════════════════════════════════════
-    if (tokens.refreshToken) {
-      let currentRefresh = tokens.refreshToken;
-      let lastError: unknown;
-      // Try up to 2 times (tokens can rotate during refresh)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const refreshed = await this.refreshOnce(currentRefresh);
-          if (!refreshed.accessToken) throw new Error("Refresh did not return an access token.");
-          await this.persistTokensToDisk(refreshed);
-          if (isLikelyValidAccessToken(refreshed.accessToken)) return refreshed.accessToken;
-          currentRefresh = refreshed.refreshToken ?? currentRefresh;
-        } catch (e) {
-          lastError = e;
-          break;
-        }
-      }
-      // Refresh failed (token revoked, expired, etc.) - clear and proceed to device code flow
-      await this.clearTokensOnDisk();
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Step 3: Check for pending device code flow in .device_code_state file
-    // ══════════════════════════════════════════════════════════════════════
-    let state = await this.readDeviceCodeState();
-    
-    if (state) {
-      // There's a pending flow - check if it's still valid
-      if (this.isDeviceCodeStateExpired(state)) {
-        // Device code expired (typically 15 min) - need to start fresh
-        await this.clearDeviceCodeState();
-        state = undefined;
-      } else {
-        // Poll Microsoft once to check if user completed the login
-        const result = await this.checkDeviceCodeResult(state);
-        
-        if (result.status === "completed") {
-          // User completed the flow! Tokens are now saved, return the access token
-          return result.accessToken;
-        }
-        
-        if (result.status === "pending") {
-          // User hasn't completed yet - throw error so agent can show instructions again
-          this.throwDeviceCodeAuthRequired(state);
-        }
-        
-        // Flow failed (expired, declined, or error) - clear state and start over
-        await this.clearDeviceCodeState();
-        state = undefined;
-      }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Step 4: No valid tokens and no pending flow - start new device code flow
-    // ══════════════════════════════════════════════════════════════════════
-    const newState = await this.startDeviceCodeLogin();
-    // Always throws - agent must catch and display login instructions to user
-    this.throwDeviceCodeAuthRequired(newState);
+    return this.getEventsByDateRange(startOfDay, endOfDay, options, calendarId);
   }
-}
-
-export class GraphCalendarClient {
-  private baseUrl: string;
-  private auth: GraphDeviceCodeAuth;
-  private fetchImpl: typeof fetch;
 
   /**
-   * Creates a new GraphCalendarClient.
-   * 
-   * The client uses device code flow for authentication. Tokens are stored in
-   * /workspace/.session/ (or custom path via tokenStorage.dir).
-   * 
-   * When calling any API method, if no valid token is available:
-   * - If a device code flow is pending, it will poll once and throw DeviceCodeAuthRequiredError if still pending
-   * - If no flow is pending, it will start one and throw DeviceCodeAuthRequiredError
-   * 
-   * The LLM agent should catch DeviceCodeAuthRequiredError and display the login
-   * instructions to the user, then retry the operation.
+   * Gets events for this week (Monday to Sunday).
+   *
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * const weekEvents = await client.getEventsThisWeek({ orderBy: "start/dateTime asc" });
+   * ```
    */
-  constructor(config: GraphClientConfig) {
-    this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
-    this.fetchImpl = config.fetchImpl ?? fetch;
-    this.auth = new GraphDeviceCodeAuth({
-      auth: config.auth,
-      fetchImpl: this.fetchImpl,
-      tokenStorage: config.tokenStorage,
-    });
+  async getEventsThisWeek(
+    options?: Omit<CalendarViewOptions, "startDateTime" | "endDateTime">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const today = new Date();
+    const dayOfWeek = today.getDay();
+    const monday = new Date(today);
+    monday.setDate(today.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+    monday.setHours(0, 0, 0, 0);
+
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    sunday.setHours(23, 59, 59, 999);
+
+    return this.getEventsByDateRange(monday, sunday, options, calendarId);
   }
 
-  private async getAccessToken(): Promise<string> {
-    return await this.auth.getValidAccessToken();
+  /**
+   * Gets events for the next N days.
+   *
+   * @param days - Number of days to look ahead
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Get events for the next 7 days
+   * const upcomingEvents = await client.getEventsNextDays(7);
+   * ```
+   */
+  async getEventsNextDays(
+    days: number,
+    options?: Omit<CalendarViewOptions, "startDateTime" | "endDateTime">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const start = new Date();
+    const end = new Date();
+    end.setDate(end.getDate() + days);
+    end.setHours(23, 59, 59, 999);
+
+    return this.getEventsByDateRange(start, end, options, calendarId);
   }
 
-  private async request<T>(
-    path: string,
-    options?: { method?: string; body?: unknown; query?: Record<string, unknown> }
-  ): Promise<T> {
-    const token = await this.getAccessToken();
-    const url = `${this.baseUrl}${path}${buildQuery(options?.query)}`;
-    const response = await this.fetchImpl(url, {
-      method: options?.method ?? "GET",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: options?.body ? JSON.stringify(options.body) : undefined,
-    });
-
-    if (!response.ok) {
-      throw new Error(await toErrorMessage(response));
-    }
-    if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
+  /**
+   * Searches events by subject (title) containing the search term.
+   *
+   * @param searchTerm - Text to search for in event subjects
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find all events with "sync" in the title
+   * const syncMeetings = await client.getEventsBySubject("sync");
+   * ```
+   */
+  async getEventsBySubject(
+    searchTerm: string,
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = `contains(subject, '${escapeODataString(searchTerm)}')`;
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  listCalendars(): Promise<{ value: GraphCalendar[] }> {
-    return this.request("/me/calendars");
+  /**
+   * Gets events organized by a specific person (by email).
+   *
+   * @param organizerEmail - Email address of the organizer
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find events organized by your manager
+   * const managerMeetings = await client.getEventsByOrganizer("manager@company.com");
+   * ```
+   */
+  async getEventsByOrganizer(
+    organizerEmail: string,
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = `organizer/emailAddress/address eq '${escapeODataString(organizerEmail)}'`;
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  listEvents(calendarId?: string, query?: { top?: number; skip?: number; filter?: string }) {
-    const path = calendarId ? `/me/calendars/${calendarId}/events` : "/me/events";
-    const graphQuery = {
-      "$top": query?.top,
-      "$skip": query?.skip,
-      "$filter": query?.filter,
-    };
-    return this.request<{ value: GraphEvent[] }>(path, { query: graphQuery });
+  /**
+   * Gets events with a specific attendee (by email).
+   *
+   * @param attendeeEmail - Email address of the attendee
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find meetings where a colleague is attending
+   * const sharedMeetings = await client.getEventsByAttendee("colleague@company.com");
+   * ```
+   */
+  async getEventsByAttendee(
+    attendeeEmail: string,
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = `attendees/any(a:a/emailAddress/address eq '${escapeODataString(attendeeEmail)}')`;
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  getCalendarView(calendarId: string, query: CalendarViewQuery) {
-    return this.request<{ value: GraphEvent[] }>(`/me/calendars/${calendarId}/calendarView`, {
-      query: {
-        startDateTime: query.startDateTime,
-        endDateTime: query.endDateTime,
-        "$top": query.top,
-        "$skip": query.skip,
-        "$orderby": query.orderby,
-      },
-    });
+  /**
+   * Gets events in a specific category.
+   *
+   * @param category - Category name
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find all events in the "Work" category
+   * const workEvents = await client.getEventsByCategory("Work");
+   * ```
+   */
+  async getEventsByCategory(
+    category: string,
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = `categories/any(c:c eq '${escapeODataString(category)}')`;
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  createEvent(calendarId: string | undefined, event: GraphEvent) {
-    const path = calendarId ? `/me/calendars/${calendarId}/events` : "/me/events";
-    return this.request<GraphEvent>(path, { method: "POST", body: event });
+  /**
+   * Gets online meetings only (Teams, Skype, etc.).
+   *
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find all online meetings
+   * const onlineMeetings = await client.getOnlineMeetings();
+   * ```
+   */
+  async getOnlineMeetings(
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = "isOnlineMeeting eq true";
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  updateEvent(calendarId: string | undefined, eventId: string, event: Partial<GraphEvent>) {
-    const path = calendarId
-      ? `/me/calendars/${calendarId}/events/${eventId}`
-      : `/me/events/${eventId}`;
-    return this.request<void>(path, { method: "PATCH", body: event });
+  /**
+   * Gets all-day events only.
+   *
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find all-day events (holidays, PTO, etc.)
+   * const allDayEvents = await client.getAllDayEvents();
+   * ```
+   */
+  async getAllDayEvents(
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = "isAllDay eq true";
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  deleteEvent(calendarId: string | undefined, eventId: string) {
-    const path = calendarId
-      ? `/me/calendars/${calendarId}/events/${eventId}`
-      : `/me/events/${eventId}`;
-    return this.request<void>(path, { method: "DELETE" });
+  /**
+   * Gets recurring event series (master events only).
+   *
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find all recurring meeting series
+   * const recurringMeetings = await client.getRecurringSeries();
+   * ```
+   */
+  async getRecurringSeries(
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = "type eq 'seriesMaster'";
+    return this.listEvents(calendarId, { ...options, filter });
   }
 
-  getSchedule(request: ScheduleRequest): Promise<ScheduleResponse> {
-    return this.request("/me/calendar/getSchedule", { method: "POST", body: request });
+  /**
+   * Gets cancelled events.
+   *
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find cancelled events
+   * const cancelledEvents = await client.getCancelledEvents();
+   * ```
+   */
+  async getCancelledEvents(
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = "isCancelled eq true";
+    return this.listEvents(calendarId, { ...options, filter });
+  }
+
+  /**
+   * Gets events with a specific importance level.
+   *
+   * @param importance - Importance level: "low", "normal", or "high"
+   * @param options - Additional query options
+   * @param calendarId - Optional calendar ID
+   *
+   * @example
+   * ```typescript
+   * // Find high-importance events
+   * const importantEvents = await client.getEventsByImportance("high");
+   * ```
+   */
+  async getEventsByImportance(
+    importance: "low" | "normal" | "high",
+    options?: Omit<EventQueryOptions, "filter">,
+    calendarId?: string
+  ): Promise<GraphCollectionResponse<GraphEvent>> {
+    const filter = `importance eq '${importance}'`;
+    return this.listEvents(calendarId, { ...options, filter });
+  }
+
+  /**
+   * Executes a raw Graph URL query through the webhook.
+   * Use this for custom queries not covered by other methods.
+   *
+   * @param graphUrl - Full Microsoft Graph URL
+   *
+   * @example
+   * ```typescript
+   * // Custom query with complex filter
+   * const result = await client.rawQuery<GraphCollectionResponse<GraphEvent>>(
+   *   "https://graph.microsoft.com/v1.0/me/events?$filter=start/dateTime ge '2024-01-01'&$top=5"
+   * );
+   * ```
+   */
+  async rawQuery<T>(graphUrl: string): Promise<T> {
+    return this.query<T>(graphUrl);
   }
 }
