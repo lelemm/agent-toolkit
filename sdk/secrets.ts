@@ -20,8 +20,9 @@ const optionalEnv = (key: string, readEnv: EnvReader): string | undefined => rea
 export const ENV_KEYS = {
   CLICKUP_TOKEN: "CLICKUP_TOKEN",
   CLICKUP_BASE_URL: "CLICKUP_BASE_URL",
-  GRAPH_ACCESS_TOKEN: "GRAPH_ACCESS_TOKEN",
   GRAPH_BASE_URL: "GRAPH_BASE_URL",
+  GRAPH_TENANT_ID: "GRAPH_TENANT_ID",
+  GRAPH_CLIENT_ID: "GRAPH_CLIENT_ID",
   TIME_TRACKING_BASE_URL: "TIME_TRACKING_BASE_URL",
   TIME_TRACKING_API_KEY: "TIME_TRACKING_API_KEY",
   VIKUNJA_BASE_URL: "VIKUNJA_BASE_URL",
@@ -36,8 +37,9 @@ export type ClickUpSecrets = {
 };
 
 export type GraphSecrets = {
-  accessToken: string;
   baseUrl?: string;
+  tenantId?: string;
+  clientId?: string;
 };
 
 export type TimeTrackingSecrets = {
@@ -61,8 +63,9 @@ export const getClickUpSecrets = (readEnv: EnvReader = defaultEnvReader): ClickU
 });
 
 export const getGraphSecrets = (readEnv: EnvReader = defaultEnvReader): GraphSecrets => ({
-  accessToken: requireEnv(ENV_KEYS.GRAPH_ACCESS_TOKEN, readEnv),
   baseUrl: optionalEnv(ENV_KEYS.GRAPH_BASE_URL, readEnv),
+  tenantId: optionalEnv(ENV_KEYS.GRAPH_TENANT_ID, readEnv),
+  clientId: optionalEnv(ENV_KEYS.GRAPH_CLIENT_ID, readEnv),
 });
 
 export const getTimeTrackingSecrets = (

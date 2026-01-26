@@ -18,33 +18,57 @@ export type GraphDeviceCodeAuthConfig = {
 
 export type GraphTokenStorageConfig = {
   /**
-   * Directory where `.access_token` and `.refresh_token` will be stored.
-   * Defaults to process.cwd().
+   * Directory where `.access_token`, `.refresh_token`, and `.device_code_state` will be stored.
+   * Defaults to "/workspace/.session".
    */
   dir?: string;
   accessTokenFilename?: string; // default ".access_token"
   refreshTokenFilename?: string; // default ".refresh_token"
+  deviceCodeStateFilename?: string; // default ".device_code_state"
 };
 
-export type GraphClientConfig =
-  | {
-      baseUrl?: string;
-      /**
-       * If you already have an access token, you can still pass it directly.
-       * (No persistence/refresh will happen in this mode.)
-       */
-      accessToken: string;
-      fetchImpl?: typeof fetch;
-    }
-  | {
-      baseUrl?: string;
-      /**
-       * Device-code auth config (public client). Tokens are stored in the working folder.
-       */
-      auth: GraphDeviceCodeAuthConfig;
-      tokenStorage?: GraphTokenStorageConfig;
-      fetchImpl?: typeof fetch;
-    };
+export type GraphClientConfig = {
+  baseUrl?: string;
+  /**
+   * Device-code auth config (public client). Tokens are stored in /workspace/.session/.
+   * LLM agents should NOT provide accessToken directly - use this auth config instead.
+   */
+  auth: GraphDeviceCodeAuthConfig;
+  tokenStorage?: GraphTokenStorageConfig;
+  fetchImpl?: typeof fetch;
+};
+
+/**
+ * Error thrown when device code authentication is required.
+ * The LLM agent should catch this and display the login instructions to the user.
+ */
+export class DeviceCodeAuthRequiredError extends Error {
+  constructor(
+    public readonly userCode: string,
+    public readonly verificationUri: string,
+    public readonly verificationUriComplete: string | undefined,
+    public readonly expiresAt: string,
+    message?: string
+  ) {
+    super(
+      message ??
+        `Authentication required. Visit ${verificationUri} and enter code: ${userCode}`
+    );
+    this.name = "DeviceCodeAuthRequiredError";
+  }
+}
+
+/**
+ * State persisted to disk during an active device code flow.
+ */
+export type DeviceCodeState = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete?: string;
+  intervalSeconds: number;
+  expiresAt: string; // ISO date
+};
 
 export type DateTimeTimeZone = {
   dateTime: string;
@@ -109,8 +133,7 @@ const DEFAULT_BASE_URL = "https://graph.microsoft.com/v1.0";
 
 const DEFAULT_DEVICE_CODE_SCOPES = [
   "offline_access",
-  "https://graph.microsoft.com/User.Read",
-  "https://graph.microsoft.com/Calendars.ReadWrite",
+  "https://graph.microsoft.com/.default"
 ];
 
 const buildQuery = (query?: Record<string, unknown>): string => {
@@ -167,21 +190,7 @@ type GraphTokenResponse = {
   error_uri?: string;
 };
 
-export type DeviceCodeStartResult = {
-  deviceCode: string;
-  userCode: string;
-  verificationUri: string;
-  verificationUriComplete?: string;
-  /**
-   * Suggested polling interval (seconds). Since polling is on-demand,
-   * this is returned only as guidance.
-   */
-  intervalSeconds: number;
-  expiresAt: string; // ISO date
-  message?: string;
-};
-
-export type DeviceCodeCheckResult =
+type DeviceCodeCheckResult =
   | { status: "pending"; nextPollInSeconds: number; message?: string }
   | { status: "completed"; accessToken: string }
   | { status: "declined"; error: string }
@@ -230,17 +239,31 @@ const normalizeScopes = (scopes?: string[]) => (scopes?.length ? scopes : DEFAUL
 
 type TokenPair = { accessToken?: string; refreshToken?: string };
 
+const DEFAULT_SESSION_DIR = "/workspace/.session";
+
 const resolveTokenPaths = async (storage?: GraphTokenStorageConfig) => {
-  const dir = storage?.dir ?? (typeof process !== "undefined" && process.cwd ? process.cwd() : ".");
+  const dir = storage?.dir ?? DEFAULT_SESSION_DIR;
   const accessName = storage?.accessTokenFilename ?? ".access_token";
   const refreshName = storage?.refreshTokenFilename ?? ".refresh_token";
+  const stateName = storage?.deviceCodeStateFilename ?? ".device_code_state";
 
   // Dynamic import so this file stays usable in non-Node environments until token persistence is used.
   const pathMod = await import("node:path");
   return {
+    dir,
     accessPath: pathMod.join(dir, accessName),
     refreshPath: pathMod.join(dir, refreshName),
+    statePath: pathMod.join(dir, stateName),
   };
+};
+
+const ensureDirectoryExists = async (dir: string): Promise<void> => {
+  const fs = await import("node:fs/promises");
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch {
+    // ignore if exists
+  }
 };
 
 const readTextFileIfExists = async (path: string): Promise<string | undefined> => {
@@ -274,7 +297,6 @@ class GraphDeviceCodeAuth {
   private scopes: string[];
   private fetchImpl: typeof fetch;
   private tokenStorage?: GraphTokenStorageConfig;
-  private lastDeviceCode?: { deviceCode: string; intervalSeconds: number };
 
   constructor(config: {
     auth: GraphDeviceCodeAuthConfig;
@@ -296,7 +318,7 @@ class GraphDeviceCodeAuth {
     return this.scopes.join(" ");
   }
 
-  async startDeviceCodeLogin(): Promise<DeviceCodeStartResult> {
+  private async startDeviceCodeLogin(): Promise<DeviceCodeState> {
     const base = getAuthorityBase(this.tenantId);
     const response = await this.fetchImpl(`${base}/devicecode`, {
       method: "POST",
@@ -308,29 +330,20 @@ class GraphDeviceCodeAuth {
     }
     const data = (await response.json()) as GraphDeviceCodeStartResponse;
     const intervalSeconds = typeof data.interval === "number" && data.interval > 0 ? data.interval : 5;
-    this.lastDeviceCode = { deviceCode: data.device_code, intervalSeconds };
-    return {
+    const state: DeviceCodeState = {
       deviceCode: data.device_code,
       userCode: data.user_code,
       verificationUri: data.verification_uri,
       verificationUriComplete: data.verification_uri_complete,
       intervalSeconds,
       expiresAt: new Date(Date.now() + data.expires_in * 1000).toISOString(),
-      message: data.message,
     };
+    await this.persistDeviceCodeState(state);
+    return state;
   }
 
-  /**
-   * Checks ONCE if the user completed the device-code flow.
-   * This method does NOT actively poll; the developer must call it explicitly.
-   */
-  async checkDeviceCodeResult(deviceCode?: string): Promise<DeviceCodeCheckResult> {
+  private async checkDeviceCodeResult(state: DeviceCodeState): Promise<DeviceCodeCheckResult> {
     const base = getAuthorityBase(this.tenantId);
-    const effectiveDeviceCode = deviceCode ?? this.lastDeviceCode?.deviceCode;
-    const intervalSeconds = this.lastDeviceCode?.intervalSeconds ?? 5;
-    if (!effectiveDeviceCode) {
-      return { status: "error", error: "Missing device_code. Call startDeviceCodeLogin() first." };
-    }
 
     const response = await this.fetchImpl(`${base}/token`, {
       method: "POST",
@@ -338,21 +351,23 @@ class GraphDeviceCodeAuth {
       body: formUrlEncode({
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
         client_id: this.clientId,
-        device_code: effectiveDeviceCode,
+        device_code: state.deviceCode,
       }),
     });
 
     const data = (await response.json()) as GraphTokenResponse;
     if (response.ok && data.access_token) {
-      const { accessPath, refreshPath } = await this.tokenPaths();
+      const { dir, accessPath, refreshPath } = await this.tokenPaths();
+      await ensureDirectoryExists(dir);
       await writeTextFile(accessPath, data.access_token);
       if (data.refresh_token) await writeTextFile(refreshPath, data.refresh_token);
+      await this.clearDeviceCodeState();
       return { status: "completed", accessToken: data.access_token };
     }
 
     const err = String(data.error ?? "unknown_error");
     if (err === "authorization_pending" || err === "slow_down") {
-      return { status: "pending", nextPollInSeconds: err === "slow_down" ? intervalSeconds + 5 : intervalSeconds };
+      return { status: "pending", nextPollInSeconds: err === "slow_down" ? state.intervalSeconds + 5 : state.intervalSeconds };
     }
     if (err === "expired_token") return { status: "expired", error: data.error_description ?? err };
     if (err === "authorization_declined") return { status: "declined", error: data.error_description ?? err };
@@ -370,7 +385,8 @@ class GraphDeviceCodeAuth {
   }
 
   private async persistTokensToDisk(tokens: TokenPair): Promise<void> {
-    const { accessPath, refreshPath } = await this.tokenPaths();
+    const { dir, accessPath, refreshPath } = await this.tokenPaths();
+    await ensureDirectoryExists(dir);
     if (tokens.accessToken) await writeTextFile(accessPath, tokens.accessToken);
     if (tokens.refreshToken) await writeTextFile(refreshPath, tokens.refreshToken);
   }
@@ -378,6 +394,32 @@ class GraphDeviceCodeAuth {
   private async clearTokensOnDisk(): Promise<void> {
     const { accessPath, refreshPath } = await this.tokenPaths();
     await Promise.all([deleteFileIfExists(accessPath), deleteFileIfExists(refreshPath)]);
+  }
+
+  private async readDeviceCodeState(): Promise<DeviceCodeState | undefined> {
+    const { statePath } = await this.tokenPaths();
+    const content = await readTextFileIfExists(statePath);
+    if (!content) return undefined;
+    try {
+      return JSON.parse(content) as DeviceCodeState;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async persistDeviceCodeState(state: DeviceCodeState): Promise<void> {
+    const { dir, statePath } = await this.tokenPaths();
+    await ensureDirectoryExists(dir);
+    await writeTextFile(statePath, JSON.stringify(state, null, 2));
+  }
+
+  private async clearDeviceCodeState(): Promise<void> {
+    const { statePath } = await this.tokenPaths();
+    await deleteFileIfExists(statePath);
+  }
+
+  private isDeviceCodeStateExpired(state: DeviceCodeState): boolean {
+    return new Date(state.expiresAt).getTime() < Date.now();
   }
 
   private async refreshOnce(refreshToken: string): Promise<TokenPair> {
@@ -400,88 +442,114 @@ class GraphDeviceCodeAuth {
     return { accessToken: data.access_token, refreshToken: data.refresh_token ?? refreshToken };
   }
 
+  private throwDeviceCodeAuthRequired(state: DeviceCodeState): never {
+    throw new DeviceCodeAuthRequiredError(
+      state.userCode,
+      state.verificationUri,
+      state.verificationUriComplete,
+      state.expiresAt,
+      `Authentication required. Visit ${state.verificationUri} and enter code: ${state.userCode}`
+    );
+  }
+
   /**
    * Loads token from disk, validates it, refreshes if needed, and persists updates.
+   * If no valid token is available, automatically handles the device code flow:
+   * - Checks for pending device code state and polls once
+   * - If completed, saves tokens and returns
+   * - If pending, throws DeviceCodeAuthRequiredError with login instructions
+   * - If expired/declined/error, clears state and starts a new flow
+   * - If no pending state, starts a new flow and throws DeviceCodeAuthRequiredError
    */
   async getValidAccessToken(): Promise<string> {
+    // Step 1: Try existing access token
     const tokens = await this.readTokensFromDisk();
-    if (tokens.accessToken && isLikelyValidAccessToken(tokens.accessToken)) return tokens.accessToken;
-
-    if (!tokens.refreshToken) {
-      throw new Error(
-        "No valid access token found. Call startDeviceCodeLogin(), then checkDeviceCodeResult() until completed."
-      );
+    if (tokens.accessToken && isLikelyValidAccessToken(tokens.accessToken)) {
+      return tokens.accessToken;
     }
 
-    // "loop": refresh can rotate tokens; try a couple times defensively.
-    let currentRefresh = tokens.refreshToken;
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const refreshed = await this.refreshOnce(currentRefresh);
-        if (!refreshed.accessToken) throw new Error("Refresh did not return an access token.");
-        await this.persistTokensToDisk(refreshed);
-        if (isLikelyValidAccessToken(refreshed.accessToken)) return refreshed.accessToken;
-        currentRefresh = refreshed.refreshToken ?? currentRefresh;
-      } catch (e) {
-        lastError = e;
-        break;
+    // Step 2: Try to refresh if we have a refresh token
+    if (tokens.refreshToken) {
+      let currentRefresh = tokens.refreshToken;
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const refreshed = await this.refreshOnce(currentRefresh);
+          if (!refreshed.accessToken) throw new Error("Refresh did not return an access token.");
+          await this.persistTokensToDisk(refreshed);
+          if (isLikelyValidAccessToken(refreshed.accessToken)) return refreshed.accessToken;
+          currentRefresh = refreshed.refreshToken ?? currentRefresh;
+        } catch (e) {
+          lastError = e;
+          break;
+        }
+      }
+      // Refresh failed - clear tokens and proceed to device code flow
+      await this.clearTokensOnDisk();
+    }
+
+    // Step 3: Check for pending device code state
+    let state = await this.readDeviceCodeState();
+    
+    if (state) {
+      // Check if the state is expired
+      if (this.isDeviceCodeStateExpired(state)) {
+        await this.clearDeviceCodeState();
+        state = undefined;
+      } else {
+        // Poll once to see if the user has completed the flow
+        const result = await this.checkDeviceCodeResult(state);
+        
+        if (result.status === "completed") {
+          return result.accessToken;
+        }
+        
+        if (result.status === "pending") {
+          // User hasn't completed yet - throw error with login instructions
+          this.throwDeviceCodeAuthRequired(state);
+        }
+        
+        // expired, declined, or error - clear state and start over
+        await this.clearDeviceCodeState();
+        state = undefined;
       }
     }
 
-    // If refresh fails, tokens are likely revoked/expired. Clear and require re-auth.
-    await this.clearTokensOnDisk();
-    const msg = lastError instanceof Error ? lastError.message : String(lastError ?? "Unknown refresh error");
-    throw new Error(`Failed to refresh access token: ${msg}. Please re-authenticate with device code flow.`);
+    // Step 4: No valid state - start a new device code flow
+    const newState = await this.startDeviceCodeLogin();
+    this.throwDeviceCodeAuthRequired(newState);
   }
 }
 
 export class GraphCalendarClient {
   private baseUrl: string;
-  private accessToken?: string;
-  private auth?: GraphDeviceCodeAuth;
+  private auth: GraphDeviceCodeAuth;
   private fetchImpl: typeof fetch;
 
+  /**
+   * Creates a new GraphCalendarClient.
+   * 
+   * The client uses device code flow for authentication. Tokens are stored in
+   * /workspace/.session/ (or custom path via tokenStorage.dir).
+   * 
+   * When calling any API method, if no valid token is available:
+   * - If a device code flow is pending, it will poll once and throw DeviceCodeAuthRequiredError if still pending
+   * - If no flow is pending, it will start one and throw DeviceCodeAuthRequiredError
+   * 
+   * The LLM agent should catch DeviceCodeAuthRequiredError and display the login
+   * instructions to the user, then retry the operation.
+   */
   constructor(config: GraphClientConfig) {
     this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
     this.fetchImpl = config.fetchImpl ?? fetch;
-    if ("accessToken" in config) {
-      this.accessToken = config.accessToken;
-    } else {
-      this.auth = new GraphDeviceCodeAuth({
-        auth: config.auth,
-        fetchImpl: this.fetchImpl,
-        tokenStorage: config.tokenStorage,
-      });
-    }
-  }
-
-  /**
-   * Starts a public device-code login. Returns the URL and code the user must enter.
-   */
-  startDeviceCodeLogin(): Promise<DeviceCodeStartResult> {
-    if (!this.auth) {
-      throw new Error("startDeviceCodeLogin() is only available when using { auth: { clientId } } config.");
-    }
-    return this.auth.startDeviceCodeLogin();
-  }
-
-  /**
-   * Checks ONCE whether the device-code flow has completed.
-   * No active polling is performed; call this explicitly as needed.
-   */
-  checkDeviceCodeResult(deviceCode?: string): Promise<DeviceCodeCheckResult> {
-    if (!this.auth) {
-      throw new Error("checkDeviceCodeResult() is only available when using { auth: { clientId } } config.");
-    }
-    return this.auth.checkDeviceCodeResult(deviceCode);
+    this.auth = new GraphDeviceCodeAuth({
+      auth: config.auth,
+      fetchImpl: this.fetchImpl,
+      tokenStorage: config.tokenStorage,
+    });
   }
 
   private async getAccessToken(): Promise<string> {
-    if (this.accessToken) return this.accessToken;
-    if (!this.auth) {
-      throw new Error("Missing access token. Provide { accessToken } or configure { auth: { clientId } }.");
-    }
     return await this.auth.getValidAccessToken();
   }
 
