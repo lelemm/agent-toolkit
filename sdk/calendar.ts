@@ -1,3 +1,79 @@
+/**
+ * Microsoft Graph Calendar API Client with Device Code Authentication
+ * ====================================================================
+ *
+ * This module provides a GraphCalendarClient that uses OAuth 2.0 Device Code Flow
+ * for authentication. This is designed for LLM agents that cannot handle interactive
+ * login flows directly.
+ *
+ * ## Authentication Flow Overview
+ *
+ * The device code flow works as follows:
+ *
+ * 1. **First API Call (No Tokens)**
+ *    - Agent calls any API method (e.g., `listEvents()`)
+ *    - No tokens exist in `/workspace/.session/`
+ *    - Client initiates device code flow with Microsoft
+ *    - Microsoft returns a user code and verification URL
+ *    - State is saved to `/workspace/.session/.device_code_state`
+ *    - `DeviceCodeAuthRequiredError` is thrown with login instructions
+ *
+ * 2. **User Authentication**
+ *    - User visits the verification URL (e.g., https://microsoft.com/devicelogin)
+ *    - User enters the code (e.g., "ABCD1234")
+ *    - User signs in and grants permissions
+ *
+ * 3. **Subsequent API Call (Pending Flow)**
+ *    - Agent retries the API call
+ *    - Client reads pending state from `.device_code_state`
+ *    - Client polls Microsoft to check if user completed login
+ *    - If still pending: throws `DeviceCodeAuthRequiredError` again
+ *    - If completed: saves tokens, clears state, proceeds with API call
+ *    - If expired/declined: clears state, starts new flow
+ *
+ * 4. **Normal Operation (Valid Tokens)**
+ *    - Agent calls API methods
+ *    - Client reads `.access_token` from disk
+ *    - If valid (not expired), uses it directly
+ *    - If expired, uses `.refresh_token` to get new access token
+ *    - If refresh fails, starts new device code flow
+ *
+ * ## File Storage
+ *
+ * All authentication state is stored in `/workspace/.session/` (configurable):
+ * - `.access_token` - The current access token (JWT, ~1 hour validity)
+ * - `.refresh_token` - The refresh token (used to get new access tokens)
+ * - `.device_code_state` - Pending device code flow state (JSON)
+ *
+ * ## Usage Example
+ *
+ * ```typescript
+ * import { GraphCalendarClient, DeviceCodeAuthRequiredError } from "./calendar";
+ *
+ * const client = new GraphCalendarClient({
+ *   auth: {
+ *     clientId: "your-app-client-id",
+ *     tenantId: "your-tenant-id", // or "common" for multi-tenant
+ *   },
+ * });
+ *
+ * try {
+ *   const events = await client.listEvents();
+ *   console.log(events);
+ * } catch (error) {
+ *   if (error instanceof DeviceCodeAuthRequiredError) {
+ *     // Display to user:
+ *     console.log(`Please visit: ${error.verificationUri}`);
+ *     console.log(`Enter code: ${error.userCode}`);
+ *     console.log(`Code expires at: ${error.expiresAt}`);
+ *     // Retry later after user completes login
+ *   } else {
+ *     throw error;
+ *   }
+ * }
+ * ```
+ */
+
 export type GraphDeviceCodeAuthConfig = {
   /**
    * Microsoft Entra application (public client) ID.
@@ -291,6 +367,15 @@ const deleteFileIfExists = async (path: string): Promise<void> => {
   }
 };
 
+/**
+ * Internal class that handles the device code authentication flow.
+ *
+ * This class manages:
+ * - Starting new device code flows
+ * - Polling for completion
+ * - Token refresh
+ * - Persisting tokens and state to disk
+ */
 class GraphDeviceCodeAuth {
   private clientId: string;
   private tenantId?: string;
@@ -318,6 +403,18 @@ class GraphDeviceCodeAuth {
     return this.scopes.join(" ");
   }
 
+  /**
+   * Initiates a new device code flow with Microsoft.
+   *
+   * This method:
+   * 1. Calls Microsoft's /devicecode endpoint
+   * 2. Receives a user_code and verification_uri
+   * 3. Persists the state to .device_code_state file
+   * 4. Returns the state for the caller to throw DeviceCodeAuthRequiredError
+   *
+   * The user must then visit the verification_uri and enter the user_code
+   * to complete authentication.
+   */
   private async startDeviceCodeLogin(): Promise<DeviceCodeState> {
     const base = getAuthorityBase(this.tenantId);
     const response = await this.fetchImpl(`${base}/devicecode`, {
@@ -342,6 +439,19 @@ class GraphDeviceCodeAuth {
     return state;
   }
 
+  /**
+   * Polls Microsoft once to check if the user has completed the device code flow.
+   *
+   * This method does NOT actively poll in a loop. It checks once and returns:
+   * - "completed": User authenticated, tokens saved to disk
+   * - "pending": User hasn't completed yet, caller should retry later
+   * - "expired": The device code expired (15 min timeout), need to start over
+   * - "declined": User declined the authorization
+   * - "error": Some other error occurred
+   *
+   * On "completed", tokens are saved to .access_token and .refresh_token,
+   * and the .device_code_state file is deleted.
+   */
   private async checkDeviceCodeResult(state: DeviceCodeState): Promise<DeviceCodeCheckResult> {
     const base = getAuthorityBase(this.tenantId);
 
@@ -357,6 +467,7 @@ class GraphDeviceCodeAuth {
 
     const data = (await response.json()) as GraphTokenResponse;
     if (response.ok && data.access_token) {
+      // Success! User completed the flow. Save tokens and clean up state.
       const { dir, accessPath, refreshPath } = await this.tokenPaths();
       await ensureDirectoryExists(dir);
       await writeTextFile(accessPath, data.access_token);
@@ -367,6 +478,7 @@ class GraphDeviceCodeAuth {
 
     const err = String(data.error ?? "unknown_error");
     if (err === "authorization_pending" || err === "slow_down") {
+      // User hasn't completed the flow yet - this is expected
       return { status: "pending", nextPollInSeconds: err === "slow_down" ? state.intervalSeconds + 5 : state.intervalSeconds };
     }
     if (err === "expired_token") return { status: "expired", error: data.error_description ?? err };
@@ -453,25 +565,87 @@ class GraphDeviceCodeAuth {
   }
 
   /**
-   * Loads token from disk, validates it, refreshes if needed, and persists updates.
-   * If no valid token is available, automatically handles the device code flow:
-   * - Checks for pending device code state and polls once
-   * - If completed, saves tokens and returns
-   * - If pending, throws DeviceCodeAuthRequiredError with login instructions
-   * - If expired/declined/error, clears state and starts a new flow
-   * - If no pending state, starts a new flow and throws DeviceCodeAuthRequiredError
+   * Main entry point for getting a valid access token.
+   *
+   * This method implements the full authentication flow:
+   *
+   * ```
+   * ┌─────────────────────────────────────────────────────────────────┐
+   * │                    getValidAccessToken()                        │
+   * └─────────────────────────────────────────────────────────────────┘
+   *                              │
+   *                              ▼
+   *              ┌───────────────────────────────┐
+   *              │ Step 1: Check .access_token   │
+   *              │ Is it valid (not expired)?    │
+   *              └───────────────────────────────┘
+   *                     │              │
+   *                    YES            NO
+   *                     │              │
+   *                     ▼              ▼
+   *              ┌──────────┐  ┌───────────────────────────┐
+   *              │ Return   │  │ Step 2: Check .refresh_token │
+   *              │ token    │  │ Try to refresh access token  │
+   *              └──────────┘  └───────────────────────────┘
+   *                                   │              │
+   *                               SUCCESS         FAILED
+   *                                   │              │
+   *                                   ▼              ▼
+   *                            ┌──────────┐  ┌───────────────────────────┐
+   *                            │ Return   │  │ Step 3: Check .device_code_state │
+   *                            │ token    │  │ Is there a pending flow?         │
+   *                            └──────────┘  └───────────────────────────┘
+   *                                                 │              │
+   *                                               YES             NO
+   *                                                 │              │
+   *                                                 ▼              │
+   *                                   ┌─────────────────────┐      │
+   *                                   │ Poll once: did user │      │
+   *                                   │ complete the flow?  │      │
+   *                                   └─────────────────────┘      │
+   *                                      │       │       │         │
+   *                                 COMPLETED  PENDING  FAILED     │
+   *                                      │       │       │         │
+   *                                      ▼       │       ▼         │
+   *                               ┌──────────┐   │  ┌──────────┐   │
+   *                               │ Return   │   │  │ Clear    │   │
+   *                               │ token    │   │  │ state    │   │
+   *                               └──────────┘   │  └──────────┘   │
+   *                                              │       │         │
+   *                                              ▼       ▼         ▼
+   *                                   ┌─────────────────────────────────┐
+   *                                   │ Step 4: Start new device code   │
+   *                                   │ flow, save state, throw error   │
+   *                                   │ with login instructions         │
+   *                                   └─────────────────────────────────┘
+   *                                                    │
+   *                                                    ▼
+   *                                   ┌─────────────────────────────────┐
+   *                                   │ throw DeviceCodeAuthRequiredError │
+   *                                   │ (userCode, verificationUri, ...)  │
+   *                                   └─────────────────────────────────┘
+   * ```
+   *
+   * @throws {DeviceCodeAuthRequiredError} When user authentication is required.
+   *         The error contains `userCode` and `verificationUri` for the user.
    */
   async getValidAccessToken(): Promise<string> {
-    // Step 1: Try existing access token
+    // ══════════════════════════════════════════════════════════════════════
+    // Step 1: Try existing access token from .access_token file
+    // ══════════════════════════════════════════════════════════════════════
     const tokens = await this.readTokensFromDisk();
     if (tokens.accessToken && isLikelyValidAccessToken(tokens.accessToken)) {
+      // Token exists and is not expired (with 60s buffer) - use it directly
       return tokens.accessToken;
     }
 
-    // Step 2: Try to refresh if we have a refresh token
+    // ══════════════════════════════════════════════════════════════════════
+    // Step 2: Try to refresh using .refresh_token file
+    // ══════════════════════════════════════════════════════════════════════
     if (tokens.refreshToken) {
       let currentRefresh = tokens.refreshToken;
       let lastError: unknown;
+      // Try up to 2 times (tokens can rotate during refresh)
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const refreshed = await this.refreshOnce(currentRefresh);
@@ -484,39 +658,46 @@ class GraphDeviceCodeAuth {
           break;
         }
       }
-      // Refresh failed - clear tokens and proceed to device code flow
+      // Refresh failed (token revoked, expired, etc.) - clear and proceed to device code flow
       await this.clearTokensOnDisk();
     }
 
-    // Step 3: Check for pending device code state
+    // ══════════════════════════════════════════════════════════════════════
+    // Step 3: Check for pending device code flow in .device_code_state file
+    // ══════════════════════════════════════════════════════════════════════
     let state = await this.readDeviceCodeState();
     
     if (state) {
-      // Check if the state is expired
+      // There's a pending flow - check if it's still valid
       if (this.isDeviceCodeStateExpired(state)) {
+        // Device code expired (typically 15 min) - need to start fresh
         await this.clearDeviceCodeState();
         state = undefined;
       } else {
-        // Poll once to see if the user has completed the flow
+        // Poll Microsoft once to check if user completed the login
         const result = await this.checkDeviceCodeResult(state);
         
         if (result.status === "completed") {
+          // User completed the flow! Tokens are now saved, return the access token
           return result.accessToken;
         }
         
         if (result.status === "pending") {
-          // User hasn't completed yet - throw error with login instructions
+          // User hasn't completed yet - throw error so agent can show instructions again
           this.throwDeviceCodeAuthRequired(state);
         }
         
-        // expired, declined, or error - clear state and start over
+        // Flow failed (expired, declined, or error) - clear state and start over
         await this.clearDeviceCodeState();
         state = undefined;
       }
     }
 
-    // Step 4: No valid state - start a new device code flow
+    // ══════════════════════════════════════════════════════════════════════
+    // Step 4: No valid tokens and no pending flow - start new device code flow
+    // ══════════════════════════════════════════════════════════════════════
     const newState = await this.startDeviceCodeLogin();
+    // Always throws - agent must catch and display login instructions to user
     this.throwDeviceCodeAuthRequired(newState);
   }
 }
