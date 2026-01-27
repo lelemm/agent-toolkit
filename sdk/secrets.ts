@@ -28,8 +28,6 @@ export const ENV_KEYS = {
   TIME_TRACKING_API_KEY: "TIME_TRACKING_API_KEY",
   VIKUNJA_BASE_URL: "VIKUNJA_BASE_URL",
   VIKUNJA_TOKEN: "VIKUNJA_TOKEN",
-  VIKUNJA_USERNAME: "VIKUNJA_USERNAME",
-  VIKUNJA_PASSWORD: "VIKUNJA_PASSWORD",
 } as const;
 
 export type ClickUpSecrets = {
@@ -55,11 +53,6 @@ export type TimeTrackingSecrets = {
 export type VikunjaSecrets = {
   baseUrl: string;
   token?: string;
-};
-
-export type VikunjaLoginSecrets = {
-  username: string;
-  password: string;
 };
 
 export const getClickUpSecrets = (readEnv: EnvReader = defaultEnvReader): ClickUpSecrets => ({
@@ -89,11 +82,4 @@ export const getTimeTrackingSecrets = (
 export const getVikunjaSecrets = (readEnv: EnvReader = defaultEnvReader): VikunjaSecrets => ({
   baseUrl: requireEnv(ENV_KEYS.VIKUNJA_BASE_URL, readEnv),
   token: optionalEnv(ENV_KEYS.VIKUNJA_TOKEN, readEnv),
-});
-
-export const getVikunjaLoginSecrets = (
-  readEnv: EnvReader = defaultEnvReader
-): VikunjaLoginSecrets => ({
-  username: requireEnv(ENV_KEYS.VIKUNJA_USERNAME, readEnv),
-  password: requireEnv(ENV_KEYS.VIKUNJA_PASSWORD, readEnv),
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ENV_KEYS, getClickUpSecrets, getVikunjaLoginSecrets, getVikunjaSecrets } from "../secrets";
+import { ENV_KEYS, getClickUpSecrets, getVikunjaSecrets } from "../secrets";
 
 describe("secrets helpers", () => {
   it("throws when required env vars are missing", () => {
@@ -15,15 +15,6 @@ describe("secrets helpers", () => {
       return undefined;
     };
     expect(getClickUpSecrets(readEnv)).toEqual({ token: "tok", baseUrl: "https://c.test" });
-  });
-
-  it("reads login secrets", () => {
-    const readEnv = (key: string) => {
-      if (key === ENV_KEYS.VIKUNJA_USERNAME) return "u";
-      if (key === ENV_KEYS.VIKUNJA_PASSWORD) return "p";
-      return "x";
-    };
-    expect(getVikunjaLoginSecrets(readEnv)).toEqual({ username: "u", password: "p" });
   });
 });
 
